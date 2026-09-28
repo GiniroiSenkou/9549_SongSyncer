@@ -7,6 +7,7 @@ import unicodedata
 from pathlib import Path
 from typing import Iterable
 
+from json_health import loose_key, loose_stem_key, has_audio_extension
 from tags_list import normalize_tag_name
 
 CURRENT_VERSION = 2
@@ -37,10 +38,14 @@ class PlaylistAssignmentStore:
         self.missing_song_records: list[dict] = []
         self.mismatch_records: list[dict] = []
         self.invalid_tag_records: list[dict] = []
+        self.duplicate_records: list[dict] = []
         self.match_source_counts: dict[str, int] = {}
         self._songs_by_path: dict[str, dict] = {}
         self._path_to_record: dict[str, dict] = {}
         self._match_source_by_path: dict[str, str] = {}
+        # Records that did not resolve to any file, keyed by loose name so a
+        # later Assign Tags / create can ADOPT them instead of cloning.
+        self._unbound_by_loose: dict[str, list[dict]] = {}
 
     def set_json_path(self, json_path: str):
         self.json_path = json_path
@@ -51,9 +56,11 @@ class PlaylistAssignmentStore:
         self.missing_song_records = []
         self.mismatch_records = []
         self.invalid_tag_records = []
+        self.duplicate_records = []
         self.match_source_counts = {}
         self._path_to_record = {}
         self._match_source_by_path = {}
+        self._unbound_by_loose = {}
 
         if not self.json_path or not os.path.exists(self.json_path):
             return
@@ -93,6 +100,12 @@ class PlaylistAssignmentStore:
         rel_map: dict[str, list[str]] = {}
         basename_map: dict[str, list[str]] = {}
         filename_map: dict[str, list[str]] = {}
+        # Loose tier: spacing/case-insensitive, tried only after every exact
+        # tier failed. Finds records that drifted ("AC dc" vs "AC DC",
+        # "Artist -Song" vs "Artist - Song") so they can be reported and fixed
+        # instead of showing up as missing.
+        loose_map: dict[str, list[str]] = {}
+        loose_stem_map: dict[str, list[str]] = {}
         result = {
             'path_to_record_indexes': {},
             'match_source_by_path': {},
@@ -101,11 +114,14 @@ class PlaylistAssignmentStore:
                 'basename': 0,
                 'filename': 0,
                 'title_filename': 0,
+                'loose': 0,
             },
             'mismatch_records': [],
             'missing_song_records': [],
             'invalid_tag_records': [],
+            'duplicate_records': [],
         }
+        duplicates_by_path: dict[str, list[int]] = {}
 
         for path, song in songs_by_path.items():
             rel_key = self._normalize_lookup_path(self._relative_song_path(path))
@@ -118,29 +134,45 @@ class PlaylistAssignmentStore:
             filename_key = self._normalize_filename(filename)
             self._remember_candidate(filename_map, filename_key, path)
 
+            disk_base = os.path.basename(path)
+            self._remember_candidate(loose_map, loose_key(disk_base), path)
+            self._remember_candidate(loose_stem_map, loose_stem_key(disk_base), path)
+
         for idx, record in enumerate(self.records):
             matched_path = ''
             match_source = ''
             candidate_paths: list[str] = []
             reason = ''
 
+            loose_name = (
+                record.get('filename', '')
+                or record.get('title_filename', '')
+                or os.path.basename(record.get('path', ''))
+                or record.get('title', '')
+            )
             lookups = [
                 ('path', self._normalize_lookup_path(record.get('path', ''))),
                 ('basename', self._normalize_filename(os.path.basename(record.get('path', '')))),
                 ('filename', self._normalize_filename(record.get('filename', ''))),
                 ('title_filename', self._normalize_filename(record.get('title_filename', ''))),
+                ('loose', loose_key(loose_name)),
+                ('loose_stem', loose_stem_key(record.get('title', '') or loose_name)),
             ]
             maps = {
                 'path': rel_map,
                 'basename': basename_map,
                 'filename': filename_map,
                 'title_filename': filename_map,
+                'loose': loose_map,
+                'loose_stem': loose_stem_map,
             }
 
             for source, key in lookups:
                 if not key:
                     continue
                 candidate_paths = list(maps[source].get(key, []))
+                if source == 'loose_stem':
+                    source = 'loose'
                 if len(candidate_paths) == 1:
                     matched_path = candidate_paths[0]
                     match_source = source
@@ -155,8 +187,23 @@ class PlaylistAssignmentStore:
                 if tag not in valid_set
             ]
             if matched_path:
-                result['path_to_record_indexes'][matched_path] = idx
-                result['match_source_by_path'][matched_path] = match_source
+                existing = result['path_to_record_indexes'].get(matched_path)
+                if existing is None:
+                    result['path_to_record_indexes'][matched_path] = idx
+                    result['match_source_by_path'][matched_path] = match_source
+                else:
+                    # Two records resolved to the same file. Never let the
+                    # later one silently shadow the earlier: report it as a
+                    # duplicate and keep as primary the one whose title
+                    # already equals the on-disk name (else the first).
+                    bucket = duplicates_by_path.setdefault(matched_path, [existing])
+                    bucket.append(idx)
+                    disk_base = os.path.basename(matched_path)
+                    primary = result['path_to_record_indexes'][matched_path]
+                    if (record.get('title') == disk_base
+                            and self.records[primary].get('title') != disk_base):
+                        result['path_to_record_indexes'][matched_path] = idx
+                        result['match_source_by_path'][matched_path] = match_source
                 result['match_source_counts'][match_source] += 1
             else:
                 if not reason:
@@ -183,6 +230,15 @@ class PlaylistAssignmentStore:
                     )
                 )
 
+        for path, indexes in duplicates_by_path.items():
+            result['duplicate_records'].append({
+                'path': path,
+                'record_indexes': list(indexes),
+                'primary_index': result['path_to_record_indexes'].get(path, indexes[0]),
+                'disk_filename': os.path.basename(path),
+                'titles': [self.records[i].get('title', '') for i in indexes],
+            })
+
         return result
 
     def apply_reconcile_result(
@@ -199,12 +255,26 @@ class PlaylistAssignmentStore:
         self.mismatch_records = list(result.get('mismatch_records', []))
         self.missing_song_records = list(result.get('missing_song_records', []))
         self.invalid_tag_records = list(result.get('invalid_tag_records', []))
+        self.duplicate_records = list(result.get('duplicate_records', []))
 
+        bound: set[int] = set()
         for path, idx in result.get('path_to_record_indexes', {}).items():
             if path in songs_by_path and 0 <= idx < len(self.records):
                 record = self.records[idx]
                 self._canonicalize_record(record, path, songs_by_path[path])
                 self._path_to_record[path] = record
+                bound.add(idx)
+        for dup in self.duplicate_records:
+            bound.update(dup.get('record_indexes', []))
+
+        self._unbound_by_loose = {}
+        for idx, record in enumerate(self.records):
+            if idx in bound:
+                continue
+            for key in {loose_key(self._record_name(record)),
+                        loose_stem_key(record.get('title', '') or self._record_name(record))}:
+                if key:
+                    self._unbound_by_loose.setdefault(key, []).append(record)
 
     def get_tags(self, song_path: str) -> list[str]:
         record = self._path_to_record.get(song_path)
@@ -215,19 +285,9 @@ class PlaylistAssignmentStore:
     def update_record_from_song(self, record_index: int, song_path: str, song: dict) -> bool:
         if not (0 <= record_index < len(self.records)):
             return False
-        record = self.records[record_index]
-        before = (
-            record.get('path', ''),
-            record.get('filename', ''),
-            record.get('title', ''),
-        )
-        self._canonicalize_record(record, song_path, song)
-        after = (
-            record.get('path', ''),
-            record.get('filename', ''),
-            record.get('title', ''),
-        )
-        return before != after
+        # Explicit "update JSON from this file" action: the on-disk name wins,
+        # including the title (strict contract: title == exact filename).
+        return self.set_record_title_from_disk_obj(self.records[record_index], song_path, song)
 
     def remove_invalid_tags_from_record(self, record_index: int, valid_tags: Iterable[str]) -> bool:
         if not (0 <= record_index < len(self.records)):
@@ -237,6 +297,86 @@ class PlaylistAssignmentStore:
         valid = set(valid_tags)
         record['tags'] = [tag for tag in before if tag in valid]
         return record['tags'] != before
+
+    # ── strict-sync fixers (used by json_health.apply_json_fixes) ───────────
+
+    def record_index(self, record: dict) -> int:
+        for idx, existing in enumerate(self.records):
+            if existing is record:
+                return idx
+        return -1
+
+    def set_record_title_from_disk(self, record_index: int, song_path: str, song: dict) -> bool:
+        if not (0 <= record_index < len(self.records)):
+            return False
+        return self.set_record_title_from_disk_obj(self.records[record_index], song_path, song)
+
+    def set_record_title_from_disk_obj(self, record: dict, song_path: str, song: dict) -> bool:
+        """Force ``title``/``filename``/``path`` to the exact on-disk name.
+        Unlike ``_canonicalize_record`` this overwrites a non-empty title —
+        it is the fix for drift, not the detector."""
+        base = song.get('filename') or os.path.basename(song_path)
+        before = (record.get('title', ''), record.get('filename', ''), record.get('path', ''))
+        record['title'] = base
+        record['filename'] = base
+        record['title_filename'] = ''
+        record['path'] = self._relative_song_path(song_path)
+        self._path_to_record[song_path] = record
+        return before != (record['title'], record['filename'], record['path'])
+
+    def merge_records(self, keep_index: int, drop_indexes: Iterable[int]) -> bool:
+        if not (0 <= keep_index < len(self.records)):
+            return False
+        drops = [self.records[i] for i in drop_indexes if 0 <= i < len(self.records)]
+        return self.merge_record_objects(self.records[keep_index], drops)
+
+    def merge_record_objects(self, keep: dict, drops: list[dict]) -> bool:
+        """Union the tags of ``drops`` into ``keep`` (order preserved) and
+        delete ``drops``. The kept record is updated in place."""
+        changed = False
+        tags = list(keep.get('tags', []))
+        for record in drops:
+            if record is keep:
+                continue
+            for tag in record.get('tags', []) or []:
+                if tag and tag not in tags:
+                    tags.append(tag)
+            if not keep.get('title') and record.get('title'):
+                keep['title'] = record['title']
+            # Identity removal, not list.remove() (value equality): two
+            # duplicate records commonly have identical content (same
+            # title, same tags), and removing "the first equal one" could
+            # silently drop a different, unrelated record instead of the
+            # one actually being merged away.
+            for i, existing in enumerate(self.records):
+                if existing is record:
+                    self.records.pop(i)
+                    changed = True
+                    break
+            for path, bound in list(self._path_to_record.items()):
+                if bound is record:
+                    self._path_to_record[path] = keep
+        if tags != list(keep.get('tags', [])):
+            keep['tags'] = tags
+            changed = True
+        return changed
+
+    def relink_record(self, record_index: int, song_path: str, song: dict) -> str:
+        if not (0 <= record_index < len(self.records)):
+            return ''
+        return self.relink_record_obj(self.records[record_index], song_path, song)
+
+    def relink_record_obj(self, record: dict, song_path: str, song: dict) -> str:
+        """Point an unmatched record at ``song_path``. If that file already
+        has a record the two are merged (tags unioned) so no clone is left
+        behind. Returns 'relinked', 'merged' or ''."""
+        existing = self._path_to_record.get(song_path)
+        if existing is not None and existing is not record:
+            self.merge_record_objects(existing, [record])
+            self.set_record_title_from_disk_obj(existing, song_path, song)
+            return 'merged'
+        self.set_record_title_from_disk_obj(record, song_path, song)
+        return 'relinked'
 
     def rewrite_tag_in_records(self, old: str, new: str | None) -> int:
         """Replace `old` with `new` (or drop it if `new is None`) in every
@@ -276,6 +416,9 @@ class PlaylistAssignmentStore:
         return len(to_remove)
 
     def create_records_for_paths(self, song_paths: Iterable[str], songs_by_path: dict[str, dict]) -> int:
+        """Make sure every path has a record. An unmatched record whose name
+        loosely equals the file (drifted case/spacing) is ADOPTED and updated
+        in place — never cloned — so its tags survive."""
         created = 0
         for path in song_paths:
             if path in self._path_to_record:
@@ -283,9 +426,27 @@ class PlaylistAssignmentStore:
             song = songs_by_path.get(path)
             if not song:
                 continue
-            self._create_record_for_song(path, song)
+            adopted = self._adopt_unbound_record(path, song)
+            if adopted is None:
+                self._create_record_for_song(path, song)
             created += 1
         return created
+
+    def _adopt_unbound_record(self, path: str, song: dict) -> dict | None:
+        base = os.path.basename(path)
+        for key in (loose_key(base), loose_stem_key(base)):
+            bucket = self._unbound_by_loose.get(key) or []
+            if len(bucket) != 1:
+                continue
+            record = bucket[0]
+            if record in self._path_to_record.values():
+                continue
+            self.set_record_title_from_disk_obj(record, path, song)
+            for candidates in self._unbound_by_loose.values():
+                if record in candidates:
+                    candidates.remove(record)
+            return record
+        return None
 
     def set_tags_for_paths(
         self,
@@ -357,7 +518,29 @@ class PlaylistAssignmentStore:
 
         os.rename(old_path, new_path)
 
+        # A file can have more than one JSON record resolved to it — a
+        # case/spacing-drifted duplicate pair (e.g. "AC dc - X.mp3" and
+        # "AC DC - X.mp3") that hasn't been merged in Sync Check yet. Only
+        # one of them is ever "the" bound record for old_path; renaming must
+        # fold every other one into it first; otherwise the un-renamed
+        # duplicate is silently left behind and, since its title no longer
+        # matches any file, reappears as a brand-new "missing" ghost entry
+        # under its old name right after the rename — never a new record,
+        # only ever a rename.
+        dup = next((d for d in self.duplicate_records if d.get('path') == old_path), None)
         record = self._path_to_record.pop(old_path, None)
+        if dup is not None:
+            indexes = [i for i in dup.get('record_indexes', []) if 0 <= i < len(self.records)]
+            primary_idx = dup.get('primary_index', indexes[0] if indexes else -1)
+            primary = self.records[primary_idx] if 0 <= primary_idx < len(self.records) else record
+            if primary is not None:
+                drops = [self.records[i] for i in indexes if 0 <= i < len(self.records)
+                         and self.records[i] is not primary]
+                if drops:
+                    self.merge_record_objects(primary, drops)
+                record = primary
+            self.duplicate_records = [d for d in self.duplicate_records if d is not dup]
+
         if record is not None:
             record['path'] = self._relative_song_path(new_path)
             record['filename'] = new_filename
@@ -413,7 +596,7 @@ class PlaylistAssignmentStore:
 
         songs = sorted(
             (self._serialize_record(record) for record in self.records),
-            key=lambda item: item.get('title', ''),
+            key=lambda item: (loose_key(item.get('title', '')), item.get('title', '')),
         )
         if self.version == 1:
             payload: object = songs
@@ -440,6 +623,8 @@ class PlaylistAssignmentStore:
         issues = []
         if self.mismatch_records:
             issues.append(f'{len(self.mismatch_records)} mismatch(es)')
+        if self.duplicate_records:
+            issues.append(f'{len(self.duplicate_records)} duplicate(s)')
         if self.invalid_tag_records:
             issues.append(f'{len(self.invalid_tag_records)} invalid tag group(s)')
         if not issues:
@@ -527,6 +712,16 @@ class PlaylistAssignmentStore:
     @staticmethod
     def _record_label(record: dict) -> str:
         return record.get('title') or record.get('filename') or record.get('path') or 'Unknown song'
+
+    @staticmethod
+    def _record_name(record: dict) -> str:
+        """Best filename-like string a record carries."""
+        return (
+            record.get('filename', '')
+            or record.get('title_filename', '')
+            or os.path.basename(record.get('path', ''))
+            or record.get('title', '')
+        )
 
     @staticmethod
     def _normalize_lookup_path(value: str) -> str:

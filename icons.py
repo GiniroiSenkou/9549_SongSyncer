@@ -414,6 +414,42 @@ def _gear(p, s, c):
     p.drawEllipse(QPointF(cx, cy), s * 0.13, s * 0.13)
 
 
+def _heart_pulse(p, s, c):
+    """Sync Check: a pulse/heartbeat trace inside a rounded frame."""
+    _pen(p, c, s, 1.8)
+    p.drawRoundedRect(QRectF(s * 0.12, s * 0.16, s * 0.76, s * 0.68), s * 0.14, s * 0.14)
+    pts = [
+        QPointF(s * 0.2, s * 0.5), QPointF(s * 0.36, s * 0.5),
+        QPointF(s * 0.44, s * 0.3), QPointF(s * 0.54, s * 0.7),
+        QPointF(s * 0.62, s * 0.5), QPointF(s * 0.8, s * 0.5),
+    ]
+    for a, b in zip(pts, pts[1:]):
+        p.drawLine(a, b)
+
+
+def _scissors(p, s, c):
+    """Trimmer: two rings and crossing blades."""
+    _pen(p, c, s, 1.8)
+    p.drawEllipse(QPointF(s * 0.28, s * 0.72), s * 0.13, s * 0.13)
+    p.drawEllipse(QPointF(s * 0.28, s * 0.28), s * 0.13, s * 0.13)
+    p.drawLine(QPointF(s * 0.38, s * 0.63), QPointF(s * 0.86, s * 0.2))
+    p.drawLine(QPointF(s * 0.38, s * 0.37), QPointF(s * 0.86, s * 0.8))
+
+
+def _check(p, s, c):
+    _pen(p, c, s, 2.2)
+    p.drawLine(QPointF(s * 0.2, s * 0.52), QPointF(s * 0.42, s * 0.74))
+    p.drawLine(QPointF(s * 0.42, s * 0.74), QPointF(s * 0.82, s * 0.3))
+
+
+def _info(p, s, c):
+    _pen(p, c, s, 1.8)
+    p.drawEllipse(QPointF(s * 0.5, s * 0.5), s * 0.36, s * 0.36)
+    _fill(p, c)
+    p.drawEllipse(QPointF(s * 0.5, s * 0.34), s * 0.045, s * 0.045)
+    p.drawRoundedRect(QRectF(s * 0.47, s * 0.44, s * 0.06, s * 0.26), 1, 1)
+
+
 # ── registry ──────────────────────────────────────────────────────────────────
 
 _ICONS = {
@@ -443,6 +479,10 @@ _ICONS = {
     'chevron_up': _chevron_up,
     'chevron_down': _chevron_down,
     'palette': _palette,
+    'heart_pulse': _heart_pulse,
+    'scissors': _scissors,
+    'check': _check,
+    'info': _info,
     'shuffle': _shuffle,
     'warning': _warning,
     'gear': _gear,

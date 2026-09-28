@@ -71,6 +71,7 @@ class PlayerBar(QFrame):
     prev_requested = pyqtSignal()
     next_requested = pyqtSignal()
     shuffle_toggled = pyqtSignal(bool)
+    position_changed = pyqtSignal(int)     # ms, for the Trimmer playhead
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -138,7 +139,10 @@ class PlayerBar(QFrame):
 
         self._title_lbl = QLabel('No song playing')
         self._title_lbl.setObjectName('playerTitle')
-        self._title_lbl.setFont(QFont('Segoe UI', 18, QFont.DemiBold))
+        _tf = self._title_lbl.font()
+        _tf.setPointSize(15)
+        _tf.setWeight(QFont.DemiBold)
+        self._title_lbl.setFont(_tf)
 
         self._artist_lbl = QLabel('')
         self._artist_lbl.setObjectName('playerArtist')
@@ -478,6 +482,7 @@ class PlayerBar(QFrame):
         if not self._seeking and self._duration_ms > 0:
             self._progress.setValue(int(self._position_ms * 1000 / self._duration_ms))
         self._time_cur.setText(_fmt_time(self._position_ms))
+        self.position_changed.emit(int(self._position_ms))
 
     @staticmethod
     def _get_duration_ms(path: str) -> int:
@@ -541,6 +546,26 @@ class PlayerBar(QFrame):
         if not self._seeking and self._duration_ms > 0:
             self._progress.setValue(int(pos_ms * 1000 / self._duration_ms))
         self._time_cur.setText(_fmt_time(pos_ms))
+        self._position_ms = int(pos_ms)
+        self.position_changed.emit(int(pos_ms))
+
+    def position_ms(self) -> int:
+        return int(self._position_ms)
+
+    def seek_ms(self, ms: int):
+        """Jump to ``ms`` in the current song (used by the Trimmer preview)."""
+        ms = max(0, int(ms))
+        if self._qt_player:
+            self._qt_player.setPosition(ms)
+        elif self._pygame_inited and self._pg_playing:
+            self._pygame.mixer.music.play(start=ms / 1000.0)
+            self._position_ms = ms
+            if self._pg_paused:
+                self._pygame.mixer.music.pause()
+        self._position_ms = ms
+        if self._duration_ms > 0 and not self._seeking:
+            self._progress.setValue(int(ms * 1000 / self._duration_ms))
+        self._time_cur.setText(_fmt_time(ms))
 
     def _on_duration(self, dur_ms):
         self._duration_ms = dur_ms

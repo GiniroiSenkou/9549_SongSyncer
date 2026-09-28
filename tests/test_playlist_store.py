@@ -253,12 +253,14 @@ class PlaylistAssignmentStoreTests(unittest.TestCase):
         self.assertFalse(store.mismatch_records)
         self.assertEqual(store.invalid_tag_records[0]['record_index'], 0)
 
-    def test_tag_aliases_are_not_reported_invalid(self):
+    def test_tag_aliases_are_reported_invalid_under_strict_matching(self):
+        # Validity is a strict exact match against the icon stems; display
+        # names / fuzzy variants are only used by the converter dialog.
         store = PlaylistAssignmentStore(library_root='/music')
-        store.records = [store._sanitize_record({
+        store.records = [{
             'title': 'Artist - Song.mp3',
-            'tags': ['Call of Duty', 'Anime Op/End', 'Hoodie'],
-        })]
+            'tags': ['Call of Duty', 'Anime Op/End', 'cod'],
+        }]
         songs = {
             '/music/Artist - Song.mp3': {
                 'path': '/music/Artist - Song.mp3',
@@ -267,35 +269,45 @@ class PlaylistAssignmentStoreTests(unittest.TestCase):
             }
         }
 
-        store.reconcile(songs, '/music', ['COD', 'Anime', 'Hoodie'])
+        store.reconcile(songs, '/music', ['cod', 'anime'])
 
-        self.assertFalse(store.invalid_tag_records)
+        self.assertEqual(len(store.invalid_tag_records), 1)
+        self.assertEqual(store.invalid_tag_records[0]['tags'], ['Call of Duty', 'Anime Op/End'])
+        self.assertEqual(store.get_tags('/music/Artist - Song.mp3'),
+                         ['Call of Duty', 'Anime Op/End', 'cod'])
 
     def test_save_persists_canonical_filename_after_title_only_import(self):
-        payload = {
+        escaped = '07 - \\u6226\\u95d8\\uff01\\u91ce\\u751f\\u30dd\\u30b1\\u30e2\\u30f3\\uff08\\u30ab\\u30f3\\u30c8\\u30fc\\uff09.mp3'
+        store, path = self._load_store({
             'version': 2,
-            'songs': [{
-                'title': '07 - \\u6226\\u95d8\\uff01\\u91ce\\u751f\\u30dd\\u30b1\\u30e2\\u30f3\\uff08\\u30ab\\u30f3\\u30c8\\u30fc\\uff09.mp3',
-                'tags': ['Pokemon'],
-            }],
-        }
-        store, path = self._load_store(payload)
+            'songs': [{'title': escaped, 'tags': ['pokemon']}],
+        })
         songs = {
-            '/music/Pokemon/07 - 戦闘！野生ポケモン（カントー）.mp3': {
-                'path': '/music/Pokemon/07 - 戦闘！野生ポケモン（カントー）.mp3',
+            '/music/07 - 戦闘！野生ポケモン（カントー）.mp3': {
+                'path': '/music/07 - 戦闘！野生ポケモン（カントー）.mp3',
                 'filename': '07 - 戦闘！野生ポケモン（カントー）.mp3',
-                'title': 'Wild Pokemon Battle',
+                'title': 'Battle',
             }
         }
+        store.reconcile(songs, '/music', ['pokemon'])
 
-        store.reconcile(songs, '/music', ['Pokemon'])
+        # Matching is lenient, so the record is found — but the escaped title
+        # is reported as drift and only rewritten once the fix is applied.
+        from json_health import build_health_report, apply_json_fixes
+        issues = build_health_report(store, songs)
+        drift = [i for i in issues if i.kind == 'title_drift']
+        self.assertEqual(len(drift), 1)
+        self.assertEqual(drift[0].suggestion, '07 - 戦闘！野生ポケモン（カントー）.mp3')
+
+        counts = apply_json_fixes(store, issues, songs)
+        self.assertEqual(counts['titles_synced'], 1)
         store.save()
 
-        saved = json.loads(path.read_text(encoding='utf-8'))
-        song = saved['songs'][0]
-        self.assertEqual(set(song.keys()), {'title', 'tags'})
+        payload = json.loads(path.read_text(encoding='utf-8'))
+        self.assertEqual(payload['version'], 2)
+        song = payload['songs'][0]
         self.assertEqual(song['title'], '07 - 戦闘！野生ポケモン（カントー）.mp3')
-        self.assertEqual(song['tags'], ['Pokemon'])
+        self.assertEqual(song['tags'], ['pokemon'])
 
     def test_update_record_from_song_canonicalizes_record(self):
         store = PlaylistAssignmentStore(library_root='/music')

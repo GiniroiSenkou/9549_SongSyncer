@@ -49,7 +49,7 @@ from PyQt5.QtWidgets import (
     QLabel, QPushButton, QFileDialog, QTableWidget, QTableWidgetItem,
     QHeaderView, QAbstractItemView, QFrame, QSizePolicy, QMessageBox,
     QStatusBar, QProgressBar, QListWidget, QListWidgetItem, QStackedWidget,
-    QMenu, QToolButton, QLineEdit,
+    QMenu, QToolButton, QLineEdit, QScrollArea, QButtonGroup,
 )
 from PyQt5.QtCore import (
     Qt, QSize, QSettings, QPropertyAnimation, QEasingCurve, QTimer,
@@ -71,16 +71,19 @@ from workers import ScanWorker, ThumbnailWorker, AutoAssignWorker, LyricsFetchWo
 from workers import PlaylistReconcileWorker
 from dialogs import (
     ImagePickerDialog, ProgressDialog, MetadataReviewDialog,
-    PlaylistAssignmentDialog, PlaylistJsonReportDialog, PlaylistSongIssueDialog,
+    PlaylistAssignmentDialog, JsonHealthDialog, PlaylistSongIssueDialog,
     SongSequencerDialog, UnsupportedTagConverterDialog, SettingsPanel,
-    IconManagerDialog,
+    IconManagerDialog, build_report_text, TrimmerDialog,
 )
+from audio_trim import format_ms
 from playlist_store import PlaylistAssignmentStore, default_playlist_json_path
+from json_health import build_health_report, apply_json_fixes, has_typo_error
 from lyrics_store import LyricsStore
+from lyrics_fetcher import SOURCE_LABELS as _LYRICS_SOURCE_LABELS
 from tags_list import TAG_ICONS, resolve_tag_icon, display_for
 from image_utils import (
     load_cropped_pixmap, get_decode_failures, reset_decode_failures,
-    icon_from_file,
+    icon_from_file, file_uri,
 )
 
 
@@ -96,11 +99,17 @@ COL_ISSUES   = 7   # JSON warning / mismatch indicator
 COL_FMT      = 8
 COL_SIZE     = 9   # file size on disk
 
-THUMB_SIZE    = 56    # table thumbnail px
+THUMB_SIZE    = 48    # table thumbnail px
 GRID_ICON     = 120   # grid card icon px
 GRID_ITEM_W   = 178
 GRID_ITEM_H   = 238
-ROW_HEIGHT    = 84
+ROW_HEIGHT    = 64
+SIDEBAR_WIDTH = 260
+TOOLBAR_H     = 56
+ACTION_BTN_H  = 36
+ACTION_ICON_PX = 20
+UI_SCALE_BASE = (1440.0, 900.0)   # screen size that maps to scale 1.0
+UI_SCALE_MAX  = 1.75
 THUMB_OVERSCAN_ROWS = 10   # rows above/below the viewport to preload
 
 
@@ -145,95 +154,195 @@ class SongTable(QTableWidget):
 
 # ── Stat Card ─────────────────────────────────────────────────────────────────
 
-class StatCard(QFrame):
-    """Compact inline stat: colored number + tiny label, no card border."""
+# ── Animation helpers ────────────────────────────────────────────────────────
 
-    clicked = pyqtSignal()
+ANIMATIONS = True
 
-    def __init__(self, label: str, color: str = '#7c3aed', parent=None):
+
+def _safe_stop(anim):
+    if anim is None:
+        return
+    try:
+        anim.stop()
+    except RuntimeError:
+        # Animation QObject may already be deleted by Qt.
+        pass
+
+
+def fade_to(stack: QStackedWidget, index: int, duration: int = 180):
+    """Switch a QStackedWidget page with a short opacity fade on the
+    incoming page (macOS-style crossfade). Falls back to a plain switch when
+    animations are disabled."""
+    if stack.currentIndex() == index:
+        return
+    page = stack.widget(index)
+    if not ANIMATIONS or page is None:
+        stack.setCurrentIndex(index)
+        return
+    effect = QGraphicsOpacityEffect(page)
+    effect.setOpacity(0.0)
+    page.setGraphicsEffect(effect)
+    stack.setCurrentIndex(index)
+    anim = QPropertyAnimation(effect, b'opacity', page)
+    anim.setDuration(duration)
+    anim.setStartValue(0.0)
+    anim.setEndValue(1.0)
+    anim.setEasingCurve(QEasingCurve.OutCubic)
+
+    def _done():
+        try:
+            page.setGraphicsEffect(None)
+        except RuntimeError:
+            pass
+    anim.finished.connect(_done)
+    anim.start(QPropertyAnimation.DeleteWhenStopped)
+
+
+def fade_in(widget: QWidget, duration: int = 200, start: float = 0.35):
+    """Brief opacity ramp used when a widget's content changes."""
+    if not ANIMATIONS:
+        return
+    effect = QGraphicsOpacityEffect(widget)
+    effect.setOpacity(start)
+    widget.setGraphicsEffect(effect)
+    anim = QPropertyAnimation(effect, b'opacity', widget)
+    anim.setDuration(duration)
+    anim.setStartValue(start)
+    anim.setEndValue(1.0)
+    anim.setEasingCurve(QEasingCurve.OutCubic)
+
+    def _done():
+        try:
+            widget.setGraphicsEffect(None)
+        except RuntimeError:
+            pass
+    anim.finished.connect(_done)
+    anim.start(QPropertyAnimation.DeleteWhenStopped)
+
+
+class Toast(QLabel):
+    """Transient confirmation pill that fades in over the content area,
+    holds, and fades out. Non-blocking replacement for informational
+    message boxes."""
+
+    def __init__(self, parent: QWidget):
         super().__init__(parent)
-        self.setObjectName('statCardInline')
-        self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
-        self.setCursor(Qt.PointingHandCursor)
+        self.setObjectName('toast')
+        self.setAlignment(Qt.AlignCenter)
+        self.setWordWrap(False)
+        self.hide()
+        self._effect = QGraphicsOpacityEffect(self)
+        self._effect.setOpacity(0.0)
+        self.setGraphicsEffect(self._effect)
+        self._anim = QPropertyAnimation(self._effect, b'opacity', self)
+        self._anim.setEasingCurve(QEasingCurve.OutCubic)
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self._fade_out)
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(10, 2, 10, 2)
-        layout.setSpacing(0)
+    def show_message(self, text: str, duration_ms: int = 3200):
+        self.setText(text)
+        self.adjustSize()
+        self.reposition()
+        self.show()
+        self.raise_()
+        _safe_stop(self._anim)
+        self._anim.setDuration(200 if ANIMATIONS else 0)
+        self._anim.setStartValue(self._effect.opacity())
+        self._anim.setEndValue(1.0)
+        self._anim.start()
+        self._timer.start(duration_ms)
 
-        self._val = QLabel('0')
-        self._val.setAlignment(Qt.AlignCenter)
-        self._color = color
-        self._val.setStyleSheet(
-            f'color: {color}; font-size: 48px; font-weight: 700;'
-        )
-
-        self._lbl = QLabel(label.upper())
-        self._lbl.setAlignment(Qt.AlignCenter)
-        self._lbl.setStyleSheet(
-            'font-size: 11px; letter-spacing: 1px; font-weight: 600;'
-        )
-        self._lbl.setObjectName('statLabel')
-
-        layout.addWidget(self._val)
-        layout.addWidget(self._lbl)
-
-        self._current = 0
-        self._count_anim = None
-        self._active = False
-
-    def set_value(self, n: int):
-        if n == self._current:
+    def reposition(self):
+        parent = self.parentWidget()
+        if parent is None:
             return
-        old = self._current
-        self._current = n
-        if self._count_anim is not None:
-            try:
-                self._count_anim.stop()
-            except RuntimeError:
-                # Animation QObject may already be deleted by Qt.
-                pass
-            self._count_anim = None
-        anim = QVariantAnimation(self)
-        anim.setStartValue(old)
-        anim.setEndValue(n)
-        anim.setDuration(min(350, 80 * abs(n - old)))
-        anim.setEasingCurve(QEasingCurve.OutCubic)
-        anim.valueChanged.connect(lambda v: self._val.setText(str(v)))
-        self._count_anim = anim
-        def _on_finished(a=anim):
-            if self._count_anim is a:
-                self._count_anim = None
-            a.deleteLater()
-        anim.finished.connect(_on_finished)
-        anim.start()
-        self._pulse()
+        self.adjustSize()
+        w = min(self.width(), max(200, parent.width() - 48))
+        self.resize(w, self.height())
+        self.move((parent.width() - w) // 2, parent.height() - self.height() - 22)
 
-    def _pulse(self):
-        """Briefly scale up the font then back down."""
-        self._val.setStyleSheet(
-            f'color: {self._color}; font-size: 56px; font-weight: 700;'
-        )
-        QTimer.singleShot(180, lambda: self._val.setStyleSheet(
-            f'color: {self._color}; font-size: 48px; font-weight: 700;'
-        ))
+    def _fade_out(self):
+        _safe_stop(self._anim)
+        self._anim.setDuration(260 if ANIMATIONS else 0)
+        self._anim.setStartValue(self._effect.opacity())
+        self._anim.setEndValue(0.0)
+        try:
+            self._anim.finished.disconnect()
+        except TypeError:
+            pass
+        self._anim.finished.connect(self._after_fade_out)
+        self._anim.start()
 
-    def set_active(self, active: bool):
-        self._active = active
-        border = self._color if active else 'transparent'
-        bg = 'rgba(255,255,255,0.04)' if active else 'transparent'
+    def _after_fade_out(self):
+        try:
+            self._anim.finished.disconnect()
+        except TypeError:
+            pass
+        if self._effect.opacity() <= 0.01:
+            self.hide()
+
+
+class LyricsProgressPill(QWidget):
+    """Compact progress readout for the background lyrics download; lives
+    under the Lyrics section of the sidebar and offers a cancel button."""
+
+    cancel_requested = pyqtSignal()
+
+    def __init__(self, theme: dict, parent=None):
+        super().__init__(parent)
+        self._theme = theme
+        self.setObjectName('lyricsPill')
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        v = QVBoxLayout(self)
+        v.setContentsMargins(10, 4, 8, 6)
+        v.setSpacing(3)
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        self._label = QLabel('Fetching lyrics…')
+        self._label.setObjectName('lyricsPillLabel')
+        row.addWidget(self._label, 1)
+        self._btn_cancel = QToolButton()
+        self._btn_cancel.setAutoRaise(True)
+        self._btn_cancel.setToolTip('Stop the lyrics download')
+        self._btn_cancel.setIconSize(QSize(12, 12))
+        self._btn_cancel.setCursor(Qt.PointingHandCursor)
+        self._btn_cancel.clicked.connect(self.cancel_requested)
+        row.addWidget(self._btn_cancel)
+        v.addLayout(row)
+        self._bar = QProgressBar()
+        self._bar.setTextVisible(False)
+        self._bar.setFixedHeight(4)
+        v.addWidget(self._bar)
+        self.apply_theme(theme)
+        self.hide()
+
+    def set_progress(self, done, total):
+        if done is None or not total:
+            self.hide()
+            return
+        self._bar.setRange(0, int(total))
+        self._bar.setValue(int(done))
+        self._label.setText(f'Lyrics {done}/{total}')
+        if not self.isVisible():
+            self.show()
+            fade_in(self)
+
+    def apply_theme(self, theme: dict):
+        self._theme = theme
+        self._label.setStyleSheet(f"color:{theme.get('text_muted', '#6e6e73')};font-size:11px;")
+        self._btn_cancel.setIcon(get_icon('x_mark', 12, theme.get('text_dim', '#8e8e93')))
         self.setStyleSheet(
-            f'#statCardInline {{ border: 1px solid {border}; border-radius: 10px; background: {bg}; }}'
+            f"QWidget#lyricsPill{{background:{theme.get('bg_card', '#ffffff')};"
+            f"border:1px solid {theme.get('border_light', '#e5e5ea')};border-radius:8px;}}"
         )
-
-    def mousePressEvent(self, event):
-        self.clicked.emit()
-        super().mousePressEvent(event)
 
 
 class StatRow(QWidget):
-    """One clickable line inside a StatSection: small colored bullet · label ·
-    value badge. Emits ``clicked`` and carries the filter mode the click
-    should activate. Theme-aware via :meth:`apply_theme`."""
+    """One clickable sidebar row: coloured dot · label · count badge.
+    Emits ``clicked`` and carries the filter mode the click activates. The
+    badge counts up when its value changes and the active state slides in
+    with a short colour animation (see :meth:`set_active`)."""
 
     clicked = pyqtSignal()
 
@@ -244,62 +353,154 @@ class StatRow(QWidget):
         self._color = color
         self._active = False
         self._theme = theme
+        self._current = 0
+        self._count_anim = None
+        self._bg_anim = None
+        self._scale = 1.0
         self.setObjectName('statRow')
+        self.setAttribute(Qt.WA_StyledBackground, True)
         self.setCursor(Qt.PointingHandCursor)
-        self.setFixedHeight(28)
+        self.setFixedHeight(32)
 
         h = QHBoxLayout(self)
-        h.setContentsMargins(8, 0, 8, 0)
+        h.setContentsMargins(10, 0, 6, 0)
         h.setSpacing(8)
 
         self._bullet = QFrame()
         self._bullet.setFixedSize(8, 8)
-        self._bullet.setStyleSheet(f'background:{color};border-radius:4px;')
         h.addWidget(self._bullet, 0, Qt.AlignVCenter)
 
         self._label = QLabel(label)
         h.addWidget(self._label, 1, Qt.AlignVCenter)
 
         self._value = QLabel('0')
-        self._value.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        self._value.setMinimumWidth(34)
+        self._value.setObjectName('statBadge')
+        self._value.setAlignment(Qt.AlignCenter)
+        self._value.setMinimumWidth(28)
+        self._value.setFixedHeight(20)
         h.addWidget(self._value, 0, Qt.AlignVCenter)
 
         self.apply_theme(theme)
 
+    def set_scale(self, scale: float):
+        """Resize the row for the current UI scale (see MainWindow._apply_ui_scale)."""
+        self._scale = scale
+        s = lambda v: max(1, int(round(v * scale)))
+        self.setFixedHeight(s(32))
+        self._bullet.setFixedSize(s(8), s(8))
+        self._bullet.setStyleSheet(f'background:{self._color};border-radius:{s(4)}px;')
+        self._value.setMinimumWidth(s(28))
+        self._value.setFixedHeight(s(20))
+        self.layout().setContentsMargins(s(10), 0, s(6), 0)
+        self.layout().setSpacing(s(8))
+        self._paint(self._target_color())
+        self._paint_badge()
+
+    # ── value ───────────────────────────────────────────────────────────────
+
     def set_value(self, n: int):
-        self._value.setText(str(n))
+        if n == self._current:
+            return
+        old = self._current
+        self._current = n
+        _safe_stop(self._count_anim)
+        self._count_anim = None
+        if not ANIMATIONS or abs(n - old) <= 1:
+            self._value.setText(str(n))
+            return
+        anim = QVariantAnimation(self)
+        anim.setStartValue(old)
+        anim.setEndValue(n)
+        anim.setDuration(min(420, 60 + 6 * abs(n - old)))
+        anim.setEasingCurve(QEasingCurve.OutCubic)
+        anim.valueChanged.connect(lambda v: self._value.setText(str(int(v))))
+        self._count_anim = anim
+
+        def _on_finished(a=anim):
+            if self._count_anim is a:
+                self._count_anim = None
+            self._value.setText(str(self._current))
+            a.deleteLater()
+        anim.finished.connect(_on_finished)
+        anim.start()
+        self._pulse_badge()
+
+    def _pulse_badge(self):
+        self._paint_badge(pulse=True)
+        QTimer.singleShot(160, lambda: self._paint_badge(pulse=False))
+
+    # ── active state ────────────────────────────────────────────────────────
 
     def set_active(self, active: bool):
         if active == self._active:
             return
         self._active = active
-        self._apply_active_style()
+        self._animate_background()
 
     def apply_theme(self, theme: dict):
         self._theme = theme
-        self._label.setStyleSheet(
-            f"color:{theme.get('text', '#1e293b')};font-size:12px;"
-        )
-        self._value.setStyleSheet(
-            f'color:{self._color};font-weight:700;font-size:14px;'
-        )
-        self._apply_active_style()
+        self._bullet.setStyleSheet(f'background:{self._color};border-radius:4px;')
+        _safe_stop(self._bg_anim)
+        self._bg_anim = None
+        self._paint(self._target_color())
+        self._paint_badge()
 
-    def _apply_active_style(self):
-        hover = self._theme.get('bg_hover', 'rgba(0,0,0,0.04)')
-        sel   = self._theme.get('bg_selection', hover)
+    def _target_color(self) -> QColor:
         if self._active:
+            return QColor(self._theme.get('sidebar_active_bg', '#007aff'))
+        return QColor(0, 0, 0, 0)
+
+    def _animate_background(self):
+        _safe_stop(self._bg_anim)
+        target = self._target_color()
+        if not ANIMATIONS:
+            self._paint(target)
+            self._paint_badge()
+            return
+        start = QColor(self._theme.get('sidebar_active_bg', '#007aff')) if not self._active \
+            else QColor(self._theme.get('bg_hover', '#ececef'))
+        anim = QVariantAnimation(self)
+        anim.setStartValue(start)
+        anim.setEndValue(target)
+        anim.setDuration(160)
+        anim.setEasingCurve(QEasingCurve.OutCubic)
+        anim.valueChanged.connect(self._paint)
+        anim.finished.connect(lambda: (self._paint(target), self._paint_badge()))
+        self._bg_anim = anim
+        anim.start(QVariantAnimation.DeleteWhenStopped)
+        self._paint_badge()
+
+    def _paint(self, bg: QColor):
+        t = self._theme
+        hover = t.get('bg_hover', '#ececef')
+        fg = t.get('sidebar_active_fg', '#ffffff') if self._active else t.get('text', '#1d1d1f')
+        bg_css = bg.name(QColor.HexArgb) if bg.alpha() < 255 else bg.name()
+        if self._active or bg.alpha() > 0:
             self.setStyleSheet(
-                f'QWidget#statRow{{background:{sel};border-radius:6px;'
-                f'border-left:3px solid {self._color};}}'
+                f'QWidget#statRow{{background:{bg_css};border-radius:6px;}}'
             )
         else:
             self.setStyleSheet(
-                'QWidget#statRow{background:transparent;border-radius:6px;'
-                'border-left:3px solid transparent;}'
+                'QWidget#statRow{background:transparent;border-radius:6px;}'
                 f'QWidget#statRow:hover{{background:{hover};}}'
             )
+        px = max(1, int(round(14 * self._scale)))
+        self._label.setStyleSheet(f'color:{fg};font-size:{px}px;background:transparent;')
+
+    def _paint_badge(self, pulse: bool = False):
+        t = self._theme
+        if self._active:
+            bg, fg = 'rgba(255,255,255,0.28)', t.get('sidebar_active_fg', '#ffffff')
+        else:
+            bg, fg = t.get('badge_bg', '#dcdce0'), t.get('badge_fg', '#3a3a3c')
+        if pulse:
+            bg = self._color
+            fg = '#ffffff'
+        s = lambda v: max(1, int(round(v * self._scale)))
+        self._value.setStyleSheet(
+            f'QLabel#statBadge{{background:{bg};color:{fg};border-radius:{s(10)}px;'
+            f'padding:0 {s(7)}px;font-size:{s(12)}px;font-weight:600;}}'
+        )
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
@@ -308,8 +509,8 @@ class StatRow(QWidget):
 
 
 class StatSection(QFrame):
-    """A small card grouping related counters: section header + N StatRows.
-    Theme-aware via :meth:`apply_theme`."""
+    """A sidebar section: small caption + N StatRows (no card chrome —
+    macOS sidebars are flat). Theme-aware via :meth:`apply_theme`."""
 
     def __init__(self, title: str, theme: dict, parent=None):
         super().__init__(parent)
@@ -318,16 +519,20 @@ class StatSection(QFrame):
         self.setObjectName('statSection')
 
         self._v = QVBoxLayout(self)
-        self._v.setContentsMargins(10, 8, 10, 8)
-        self._v.setSpacing(2)
+        self._v.setContentsMargins(4, 6, 4, 2)
+        self._v.setSpacing(1)
 
-        self._title_lbl = QLabel(title.upper())
+        self._title_lbl = QLabel(title)
+        self._title_lbl.setObjectName('sidebarCaption')
         self._v.addWidget(self._title_lbl)
         self.apply_theme(theme)
 
     def add_row(self, row: StatRow):
         self._rows[row.filter_mode] = row
         self._v.addWidget(row)
+
+    def add_widget(self, widget: QWidget):
+        self._v.addWidget(widget)
 
     def row(self, filter_mode: str) -> StatRow | None:
         return self._rows.get(filter_mode)
@@ -337,18 +542,22 @@ class StatSection(QFrame):
 
     def apply_theme(self, theme: dict):
         self._theme = theme
-        bg     = theme.get('bg_card', '#ffffff')
-        border = theme.get('border', '#e2e8f0')
-        dim    = theme.get('text_muted', '#64748b')
-        self.setStyleSheet(
-            'QFrame#statSection{background:%s;border:1px solid %s;'
-            'border-radius:10px;}' % (bg, border)
-        )
+        self.setStyleSheet('QFrame#statSection{background:transparent;border:none;}')
+        px = max(1, int(round(12 * getattr(self, '_scale', 1.0))))
         self._title_lbl.setStyleSheet(
-            f'color:{dim};font-size:10px;font-weight:700;letter-spacing:1px;'
+            f"color:{theme.get('text_dim', '#8e8e93')};font-size:{px}px;font-weight:600;"
+            f"letter-spacing:0.4px;padding:0 6px;background:transparent;"
         )
         for row in self._rows.values():
             row.apply_theme(theme)
+
+    def set_scale(self, scale: float):
+        self._scale = scale
+        s = lambda v: max(1, int(round(v * scale)))
+        self._v.setContentsMargins(s(4), s(8), s(4), s(2))
+        self.apply_theme(self._theme)
+        for row in self._rows.values():
+            row.set_scale(scale)
 
 
 class ElidedLabel(QLabel):
@@ -357,6 +566,14 @@ class ElidedLabel(QLabel):
     def __init__(self, text: str = '', parent=None):
         super().__init__(parent)
         self._full_text = ''
+        self._elide_mode = Qt.ElideLeft
+        self.set_full_text(text)
+
+    def setElideMode(self, mode):
+        self._elide_mode = mode
+        self._apply_elide()
+
+    def setText(self, text: str):
         self.set_full_text(text)
 
     def set_full_text(self, text: str):
@@ -376,7 +593,7 @@ class ElidedLabel(QLabel):
             return
         text = self.fontMetrics().elidedText(
             self._full_text,
-            Qt.ElideLeft,
+            self._elide_mode,
             max(self.contentsRect().width() - 4, 24),
         )
         super().setText(text)
@@ -400,9 +617,10 @@ class AutoFitButton(QPushButton):
     precedence over ``setFont`` per Qt's stylesheet semantics.
     """
 
-    _FIT_MIN_PX     = 8
-    _FIT_COMFORT_PX = 11
-    _FIT_MAX_PX     = 15
+    _FIT_MIN_PX     = 10
+    _FIT_COMFORT_PX = 12
+    _FIT_MAX_PX     = 14
+    _FIT_ALLOW_WRAP = False   # 32 px buttons have no room for two lines
     _STYLE_MARKER   = '/*autofit*/'
 
     # Hysteresis margin (px): once wrapped, only un-wrap when single-line
@@ -412,6 +630,13 @@ class AutoFitButton(QPushButton):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._fit_current_px: int | None = None
+        self._fit_min = self._FIT_MIN_PX
+        self._fit_comfort = self._FIT_COMFORT_PX
+        self._fit_max = self._FIT_MAX_PX
+        self._icon_only = False
+        self._icon_hidden = False
+        self._stored_icon: QIcon | None = None
+        self._reserve = 30   # QSS padding (2×10) + icon↔text gap + safety
         # The original, single-line label provided by the caller. We may
         # render it as two lines internally without losing the source string.
         self._fit_base_text: str = super().text()
@@ -433,20 +658,69 @@ class AutoFitButton(QPushButton):
             self._fit_timer.start(30)
 
     def setIcon(self, icon):
-        super().setIcon(icon)
+        self._stored_icon = QIcon(icon)
+        if self._icon_hidden:
+            super().setIcon(QIcon())
+        else:
+            super().setIcon(icon)
         self._fit_timer.start(30)
+
+    def set_icon_hidden(self, hidden: bool):
+        """Middle step between full buttons and icon-only: text without the
+        icon (text is the more informative half)."""
+        if hidden == self._icon_hidden:
+            return
+        self._icon_hidden = hidden
+        super().setIcon(QIcon() if hidden else (self._stored_icon or QIcon()))
+        self._fit_current_px = None
+        self._fit_timer.start(0)
+
+    def set_fit_range(self, min_px: int, comfort_px: int, max_px: int, reserve: int | None = None):
+        """Pixel-size window used by the fitter (scaled with the UI)."""
+        self._fit_min, self._fit_comfort, self._fit_max = min_px, comfort_px, max_px
+        if reserve is not None:
+            self._reserve = reserve
+        self._fit_current_px = None
+        self._fit_timer.start(0)
+
+    def fits_text_at(self, px: int, width: int) -> bool:
+        """Would the (single-line) label fit in ``width`` at ``px``?"""
+        font = QFont(self.font())
+        font.setPixelSize(px)
+        icon_w = self.iconSize().width() if (self._stored_icon and not self._icon_hidden) else 0
+        return QFontMetrics(font).horizontalAdvance(self._fit_base_text) + icon_w + self._reserve <= width
+
+    def base_text(self) -> str:
+        return self._fit_base_text
+
+    def set_icon_only(self, on: bool):
+        """Hide the label (keeping it as the tooltip) when a group is too
+        narrow for readable text; restore it when room comes back."""
+        if on == self._icon_only:
+            return
+        self._icon_only = on
+        self._fitting = True
+        try:
+            super().setText('' if on else self._fit_base_text)
+        finally:
+            self._fitting = False
+        if on:
+            if not self.toolTip():
+                self.setToolTip(self._fit_base_text)
+        else:
+            self._fit_current_px = None
+            self._fit_timer.start(0)
 
     # ── fitting -------------------------------------------------------------
 
     def _fit_text(self):
-        if self._fitting:
+        if self._fitting or self._icon_only:
             return
         text = self._fit_base_text
         if not text:
             return
         icon_w = self.iconSize().width() if not self.icon().isNull() else 0
-        # style.py: padding 16 px each side + ~6 px icon↔text gap + 2 safety
-        avail = self.width() - icon_w - 40
+        avail = self.width() - icon_w - self._reserve
         if avail <= 0:
             return
 
@@ -458,26 +732,26 @@ class AutoFitButton(QPushButton):
         unwrap_avail = avail - (self._FIT_UNWRAP_MARGIN if currently_wrapped else 0)
 
         # 1) single-line, MAX → COMFORT
-        for px in range(self._FIT_MAX_PX, self._FIT_COMFORT_PX - 1, -1):
+        for px in range(self._fit_max, self._fit_comfort - 1, -1):
             if self._fits(text, px, unwrap_avail):
                 self._apply(px, text)
                 return
 
         # 2) two-line wrap, MAX → COMFORT
-        wrapped = self._wrap_at_middle(text)
+        wrapped = self._wrap_at_middle(text) if self._FIT_ALLOW_WRAP else text
         if wrapped != text:
-            for px in range(self._FIT_MAX_PX, self._FIT_COMFORT_PX - 1, -1):
+            for px in range(self._fit_max, self._fit_comfort - 1, -1):
                 if self._fits(wrapped, px, avail):
                     self._apply(px, wrapped)
                     return
 
         # 3) single-line, COMFORT-1 → MIN
-        for px in range(self._FIT_COMFORT_PX - 1, self._FIT_MIN_PX - 1, -1):
+        for px in range(self._fit_comfort - 1, self._fit_min - 1, -1):
             if self._fits(text, px, avail):
                 self._apply(px, text)
                 return
 
-        self._apply(self._FIT_MIN_PX, text)
+        self._apply(self._fit_min, text)
 
     def _fits(self, text: str, px: int, avail: int) -> bool:
         font = QFont(self.font())
@@ -589,9 +863,18 @@ class MainWindow(QMainWindow):
         self._path_to_tag_label: dict[str, QLabel] = {}
         self._path_to_issue_button: dict[str, QToolButton] = {}
         self._playlist_issues_by_path: dict[str, list[dict]] = {}
+        # Strict-sync audit (json_health) — rebuilt after every reconcile.
+        self._health_issues: list = []
+        self._health_by_path: dict[str, list] = {}
         self._grid_build_queue: deque[str] = deque()
         self._grid_chunk_timer: QTimer | None = None
         self._is_scanning: bool = False
+        # Set while a caller is inserting several table rows in one batch
+        # (currently only _sync_ghost_rows) so _add_table_row skips its own
+        # per-row setSortingEnabled(True) — re-enabling sort on a non-empty
+        # table forces a full re-sort, so toggling it once per row while
+        # rebuilding N ghost rows was an O(N * table size) sort storm.
+        self._bulk_row_update: bool = False
         self._folder: str = ''
         self._settings = QSettings('SongSyncer', 'SongSyncer')
         self._tag_icons = {
@@ -607,6 +890,8 @@ class MainWindow(QMainWindow):
         if lyrics_folder:
             self._lyrics_store.set_folder(lyrics_folder)
         self._lyrics_fetch_worker: LyricsFetchWorker | None = None
+        self._lyrics_fetch_is_auto = False
+        self._lyrics_stats_timer: QTimer | None = None
         # Pending sync state — set while the Settings page is open, run when
         # the user closes Settings. Lets the app start without any
         # background work until the user is ready.
@@ -616,6 +901,10 @@ class MainWindow(QMainWindow):
         self._active_song_filter = 'all'
         self._search_query: str = ''
         self._ghost_paths: set[str] = set()
+        # Cache for _sync_ghost_rows's skip-if-unchanged check — None never
+        # matches a real (possibly empty) frozenset, so it forces the first
+        # call after init/rescan to actually run.
+        self._last_missing_record_indexes: frozenset[int] | None = None
         self._current_play_path: str = ''
         reset_decode_failures()
 
@@ -641,6 +930,10 @@ class MainWindow(QMainWindow):
         self._playlist_reconcile_pending = False
         self._playlist_reconcile_rerun_needed = False
         self._action_layout_update_pending = False
+        self._ui_scale = 1.0
+        self._ui_scale_applied = False
+        self._row_height = ROW_HEIGHT
+        self._action_icon_px = ACTION_ICON_PX
 
         # ── window ─────────────────────────────────────────────────────────────
         self.setWindowTitle('SongSyncer')
@@ -653,6 +946,10 @@ class MainWindow(QMainWindow):
             self.setWindowIcon(icon_from_file(_icon_path, 64))
 
         # ── build UI ──────────────────────────────────────────────────────────
+        # macOS-style layout: a fixed sidebar on the left (library filters
+        # with count badges, paths, settings), a content column on the right
+        # (toolbar → action bar → song list), and the player bar spanning the
+        # full width at the bottom.
         central = QWidget()
         central.setObjectName('centralWidget')
         self.setCentralWidget(central)
@@ -661,16 +958,25 @@ class MainWindow(QMainWindow):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        root.addWidget(self._build_header())
+        body = QHBoxLayout()
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(0)
+        self._sidebar = self._build_sidebar()
+        body.addWidget(self._sidebar)
 
-        # Library content (action bar + song view) lives on page 0 of an
-        # outer stack; page 1 is the in-place Settings panel.
+        # Library content (toolbar + action bar + song view) lives on page 0
+        # of the content stack; page 1 is the in-place Settings panel.
         library_widget = QWidget()
+        library_widget.setObjectName('libraryPage')
         library_layout = QVBoxLayout(library_widget)
         library_layout.setContentsMargins(0, 0, 0, 0)
         library_layout.setSpacing(0)
+        self._toolbar = self._build_toolbar()
+        library_layout.addWidget(self._toolbar)
         library_layout.addWidget(self._build_action_bar())
         library_layout.addWidget(self._build_song_view(), 1)
+        self._library_widget = library_widget
+        self._toast = Toast(library_widget)
 
         self._settings_panel = SettingsPanel(
             theme=self._theme,
@@ -686,12 +992,15 @@ class MainWindow(QMainWindow):
         self._settings_panel.json_refresh_requested.connect(self._on_settings_json_refresh)
         self._settings_panel.lyrics_refresh_requested.connect(self._on_settings_lyrics_refresh)
         self._settings_panel.icon_manager_requested.connect(self._on_manage_icons)
+        self._settings_panel.auto_lyrics_toggled.connect(self._on_auto_lyrics_toggled)
+        self._settings_panel.set_auto_lyrics(self._lyrics_auto_enabled())
         self._settings_panel.close_requested.connect(self._on_settings_close)
 
         self._main_stack = QStackedWidget()
         self._main_stack.addWidget(library_widget)
         self._main_stack.addWidget(self._settings_panel)
-        root.addWidget(self._main_stack, 1)
+        body.addWidget(self._main_stack, 1)
+        root.addLayout(body, 1)
 
         # player bar (slides up from the bottom)
         self._player_bar = PlayerBar(self)
@@ -735,22 +1044,30 @@ class MainWindow(QMainWindow):
         """Return the current theme's secondary text color for icon tinting."""
         return self._theme['text_secondary']
 
-    def _build_header(self) -> QWidget:
+    def _build_sidebar(self) -> QWidget:
+        """Left column: identity, filter sections with count badges, lyrics
+        progress, current folder, Settings + theme buttons."""
         w = QWidget()
-        w.setObjectName('header')
-        w.setFixedHeight(110)
+        w.setObjectName('sidebar')
+        w.setAttribute(Qt.WA_StyledBackground, True)
+        w.setFixedWidth(SIDEBAR_WIDTH)
 
-        h = QHBoxLayout(w)
-        h.setContentsMargins(20, 0, 20, 0)
-        h.setSpacing(14)
+        v = QVBoxLayout(w)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(0)
 
-        # app icon (top-left)
+        # ── identity ──
+        ident = QWidget()
+        ident.setObjectName('sidebarIdentity')
+        ih = QHBoxLayout(ident)
+        ih.setContentsMargins(16, 16, 12, 10)
+        ih.setSpacing(10)
         icon_lbl = QLabel()
         _hdr_icon = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'icon.png')
         header_set = False
         if os.path.exists(_hdr_icon):
             try:
-                _px = load_cropped_pixmap(Path(_hdr_icon).read_bytes(), 42)
+                _px = load_cropped_pixmap(Path(_hdr_icon).read_bytes(), 30)
                 if _px:
                     icon_lbl.setPixmap(_px)
                     header_set = True
@@ -758,26 +1075,24 @@ class MainWindow(QMainWindow):
                 pass
         if not header_set:
             icon_lbl.setPixmap(
-                get_icon('music_note', 36, self._theme['accent']).pixmap(36, 36)
+                get_icon('music_note', 26, self._theme['accent']).pixmap(26, 26)
             )
-
         col = QVBoxLayout()
         col.setSpacing(0)
         title = QLabel('SongSyncer')
         title.setObjectName('appTitle')
-        sub = QLabel('COVER ART MANAGER')
+        sub = QLabel('LIBRARY MANAGER')
         sub.setObjectName('appSubtitle')
         col.addWidget(title)
         col.addWidget(sub)
+        ih.addWidget(icon_lbl)
+        ih.addLayout(col, 1)
+        v.addWidget(ident)
 
-        h.addWidget(icon_lbl)
-        h.addLayout(col)
-
-        # ── sectioned stat form ──
-        # Each section groups related counters. Clicking a row applies the
-        # corresponding filter; the filter→row map lives in
-        # `_stat_rows_by_filter` so `_apply_song_filter` can highlight the
-        # active row.
+        # ── filter sections (scrollable on short windows) ──
+        # Clicking a row applies the corresponding filter; the filter→row map
+        # lives in `_stat_rows_by_filter` so `_apply_song_filter` can
+        # highlight the active row.
         self._stat_rows_by_filter: dict[str, StatRow] = {}
 
         def _make_row(label: str, color: str, filter_mode: str) -> StatRow:
@@ -786,332 +1101,355 @@ class MainWindow(QMainWindow):
             self._stat_rows_by_filter[filter_mode] = row
             return row
 
-        sec_music = StatSection('Music Files', self._theme)
-        sec_music.add_row(_make_row('Total', self._theme.get('accent', '#7c3aed'), 'all'))
+        t = self._theme
+        sec_music = StatSection('Library', t)
+        sec_music.add_row(_make_row('All Songs', t.get('accent', '#007aff'), 'all'))
 
-        sec_art = StatSection('Artwork', self._theme)
-        sec_art.add_row(_make_row('No Cover', self._theme.get('red', '#dc2626'), 'no_cover'))
+        # "New" is deliberately its own section, separate from "JSON": it
+        # flags songs the app has never touched (no JSON entry AND no cover
+        # AND no metadata) — a library-freshness signal, not a JSON sync
+        # problem. A song that already has a cover/metadata but lost its
+        # JSON entry shows up under JSON → Missing Entries / Sync Issues
+        # instead, never here.
+        sec_new = StatSection('New', t)
+        sec_new.add_row(_make_row('New Songs', t.get('green', '#34c759'), 'new_song'))
 
-        sec_meta = StatSection('Metadata', self._theme)
-        sec_meta.add_row(_make_row('No metadata', self._theme.get('orange', '#b45309'), 'no_meta'))
+        sec_art = StatSection('Artwork', t)
+        sec_art.add_row(_make_row('No Cover', t.get('red', '#ff3b30'), 'no_cover'))
 
-        sec_typo = StatSection('File Issues', self._theme)
-        sec_typo.add_row(_make_row('Typo errors', self._theme.get('warning_fg', '#f59e0b'), 'typo_errors'))
+        sec_meta = StatSection('Metadata', t)
+        sec_meta.add_row(_make_row('No Metadata', t.get('orange', '#ff9500'), 'no_meta'))
+        sec_meta.add_row(_make_row('Typo Errors', t.get('warning_fg', '#c77700'), 'typo_errors'))
 
-        sec_json = StatSection('JSON', self._theme)
-        sec_json.add_row(_make_row('Missing entries', self._theme.get('accent', '#7c3aed'), 'missing_file'))
-        sec_json.add_row(_make_row('No tags',         self._theme.get('blue', '#2563eb'), 'no_tags'))
-        sec_json.add_row(_make_row('JSON errors',     self._theme.get('red', '#dc2626'), 'mismatch'))
+        sec_json = StatSection('JSON', t)
+        sec_json.add_row(_make_row('Missing Entries', t.get('accent', '#007aff'), 'missing_file'))
+        sec_json.add_row(_make_row('No Tags',         t.get('blue', '#007aff'), 'no_tags'))
+        sec_json.add_row(_make_row('Sync Issues',     t.get('orange', '#ff9500'), 'health'))
+        sec_json.add_row(_make_row('Invalid Tags',    t.get('red', '#ff3b30'), 'mismatch'))
 
-        sec_lyr = StatSection('Lyrics', self._theme)
-        sec_lyr.add_row(_make_row('No Lyrics', self._theme.get('cyan', '#0891b2'), 'no_lyrics'))
-        sec_lyr.add_row(_make_row('Orphan files', self._theme.get('red', '#dc2626'), 'lyrics_orphan'))
+        sec_lyr = StatSection('Lyrics', t)
+        sec_lyr.add_row(_make_row('No Lyrics', t.get('cyan', '#32ade6'), 'no_lyrics'))
+        sec_lyr.add_row(_make_row('Not Found Online', t.get('orange', '#ff9500'), 'lyrics_not_found'))
+        sec_lyr.add_row(_make_row('Orphan Files', t.get('red', '#ff3b30'), 'lyrics_orphan'))
+        self._lyrics_progress = LyricsProgressPill(t)
+        self._lyrics_progress.cancel_requested.connect(self._cancel_lyrics_fetch)
+        sec_lyr.add_widget(self._lyrics_progress)
 
-        # Cache sections so we can show/hide on theme refresh if needed.
-        self._stat_sections = [sec_music, sec_art, sec_meta, sec_typo, sec_json, sec_lyr]
+        self._stat_sections = [sec_music, sec_new, sec_art, sec_meta, sec_json, sec_lyr]
+
+        scroll = QScrollArea()
+        scroll.setObjectName('sidebarScroll')
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        inner = QWidget()
+        inner.setObjectName('sidebarInner')
+        iv = QVBoxLayout(inner)
+        iv.setContentsMargins(8, 0, 8, 8)
+        iv.setSpacing(4)
         for sec in self._stat_sections:
-            h.addWidget(sec)
+            iv.addWidget(sec)
+        iv.addStretch(1)
+        scroll.setWidget(inner)
+        v.addWidget(scroll, 1)
 
-        self._btn_sequenze = AutoFitButton('Edit Song')
+        # ── footer: folder + settings/theme ──
+        footer = QWidget()
+        footer.setObjectName('sidebarFooter')
+        fv = QVBoxLayout(footer)
+        fv.setContentsMargins(12, 6, 10, 10)
+        fv.setSpacing(4)
+
+        self._folder_lbl = ElidedLabel('No folder selected')
+        self._folder_lbl.setObjectName('folderPath')
+        self._folder_lbl.setToolTip('Music folder — change it in Settings')
+        fv.addWidget(self._folder_lbl)
+
+        fh = QHBoxLayout()
+        fh.setSpacing(4)
+        # Settings (gear) — opens the Settings page where all three paths
+        # (Music / JSON / Lyrics) are configured.
+        self._btn_settings = QPushButton()
+        self._btn_settings.setObjectName('btnToolbar')
+        self._btn_settings.setIcon(get_icon('gear', 18, self._icon_color()))
+        self._btn_settings.setIconSize(QSize(18, 18))
+        self._btn_settings.setToolTip('Settings (Music / JSON / Lyrics paths)')
+        self._btn_settings.setFixedSize(34, 32)
+        self._btn_settings.setCursor(Qt.PointingHandCursor)
+        self._btn_settings.clicked.connect(self._on_open_settings)
+
+        self._btn_theme = QPushButton()
+        self._btn_theme.setObjectName('btnThemeToggle')
+        self._btn_theme.setToolTip('Switch theme')
+        self._btn_theme.setFixedSize(34, 32)
+        self._btn_theme.setCursor(Qt.PointingHandCursor)
+        self._btn_theme.clicked.connect(self._on_toggle_theme)
+        self._update_theme_icon()
+
+        self._theme_name_lbl = QLabel(self._theme['name'])
+        self._theme_name_lbl.setObjectName('appSubtitle')
+        fh.addWidget(self._btn_settings)
+        fh.addWidget(self._btn_theme)
+        fh.addWidget(self._theme_name_lbl)
+        fh.addStretch(1)
+        fv.addLayout(fh)
+        v.addWidget(footer)
+
+        # Internal rescan-enabled state, formerly tied to `_btn_rescan`,
+        # is now consulted by `_on_open_settings` only when needed.
+        self._can_rescan = False
+        return w
+
+    def _build_toolbar(self) -> QWidget:
+        """Top of the content column: active filter title + count, centred
+        search field, List | Grid segmented control, Edit Song."""
+        w = QWidget()
+        w.setObjectName('toolbar')
+        w.setAttribute(Qt.WA_StyledBackground, True)
+        w.setFixedHeight(TOOLBAR_H)
+
+        h = QHBoxLayout(w)
+        h.setContentsMargins(20, 0, 16, 0)
+        h.setSpacing(10)
+
+        title_col = QVBoxLayout()
+        title_col.setSpacing(0)
+        self._filter_title_lbl = QLabel('All Songs')
+        self._filter_title_lbl.setObjectName('filterTitle')
+        self._filter_count_lbl = QLabel('')
+        self._filter_count_lbl.setObjectName('filterCount')
+        title_col.addWidget(self._filter_title_lbl)
+        title_col.addWidget(self._filter_count_lbl)
+        h.addLayout(title_col)
+        h.addStretch(1)
+
+        self._search_bar = QLineEdit()
+        self._search_bar.setObjectName('searchBar')
+        self._search_bar.setPlaceholderText('Search')
+        self._search_bar.setFixedHeight(32)
+        self._search_bar.setMinimumWidth(220)
+        self._search_bar.setMaximumWidth(420)
+        self._search_bar.setClearButtonEnabled(True)
+        self._search_bar.addAction(get_icon('search', 14, self._icon_color()), QLineEdit.LeadingPosition)
+        self._search_bar.textChanged.connect(self._on_search_changed)
+        h.addWidget(self._search_bar, 2)
+        h.addStretch(1)
+
+        seg = QHBoxLayout()
+        seg.setSpacing(0)
+        self._view_group = QButtonGroup(self)
+        self._view_group.setExclusive(True)
+        self._btn_view_list = QPushButton('List')
+        self._btn_view_list.setObjectName('btnSegLeft')
+        self._btn_view_list.setCheckable(True)
+        self._btn_view_list.setChecked(True)
+        self._btn_view_list.setIcon(get_icon('list', 14, '#ffffff'))
+        self._btn_view_list.setIconSize(QSize(14, 14))
+        self._btn_view_list.setFixedHeight(30)
+        self._btn_view_list.setCursor(Qt.PointingHandCursor)
+        self._btn_view_list.clicked.connect(lambda: self._on_set_view('list'))
+        self._btn_view_grid = QPushButton('Grid')
+        self._btn_view_grid.setObjectName('btnSegRight')
+        self._btn_view_grid.setCheckable(True)
+        self._btn_view_grid.setIcon(get_icon('grid', 14, self._icon_color()))
+        self._btn_view_grid.setIconSize(QSize(14, 14))
+        self._btn_view_grid.setFixedHeight(30)
+        self._btn_view_grid.setCursor(Qt.PointingHandCursor)
+        self._btn_view_grid.clicked.connect(lambda: self._on_set_view('grid'))
+        self._view_group.addButton(self._btn_view_list)
+        self._view_group.addButton(self._btn_view_grid)
+        seg.addWidget(self._btn_view_list)
+        seg.addWidget(self._btn_view_grid)
+        h.addLayout(seg)
+
+        self._btn_sequenze = QPushButton('Edit Song')
         self._btn_sequenze.setObjectName('btnSequenze')
-        self._btn_sequenze.setFixedHeight(44)
-        self._btn_sequenze.setMinimumWidth(110)
+        self._btn_sequenze.setIcon(get_icon('pencil', 14, '#ffffff'))
+        self._btn_sequenze.setIconSize(QSize(14, 14))
+        self._btn_sequenze.setFixedHeight(30)
+        self._btn_sequenze.setCursor(Qt.PointingHandCursor)
         self._btn_sequenze.setToolTip(
-            'Open the focused single-song editor on the currently selected song. '
+            'Open the focused single-song editor on the selected song. '
             'Use Previous/Next to step through every song in the current filter.'
         )
         self._btn_sequenze.clicked.connect(self._on_sequenze)
         h.addWidget(self._btn_sequenze)
 
-        h.addStretch()
-
-        self._folder_lbl = QLabel('No folder selected')
-        self._folder_lbl.setObjectName('folderPath')
-        self._folder_lbl.setMaximumWidth(400)
-
-        # Settings (gear) — opens the Settings dialog where all three paths
-        # (Music / JSON / Lyrics) are configured. Replaces the old separate
-        # folder picker and rescan buttons.
-        self._btn_settings = QPushButton()
-        self._btn_settings.setObjectName('btnThemeToggle')   # reuse stylesheet
-        self._btn_settings.setIcon(get_icon('gear', 22, self._icon_color()))
-        self._btn_settings.setIconSize(QSize(22, 22))
-        self._btn_settings.setToolTip('Open Settings (Music / JSON / Lyrics paths)')
-        self._btn_settings.setFixedSize(52, 48)
-        self._btn_settings.setCursor(Qt.PointingHandCursor)
-        self._btn_settings.clicked.connect(self._on_open_settings)
-
-        # Theme toggle stays next to Settings.
-        self._btn_theme = QPushButton()
-        self._btn_theme.setObjectName('btnThemeToggle')
-        self._btn_theme.setToolTip('Switch theme')
-        self._btn_theme.setFixedSize(52, 48)
-        self._btn_theme.setCursor(Qt.PointingHandCursor)
-        self._btn_theme.clicked.connect(self._on_toggle_theme)
-        self._update_theme_icon()
-
-        h.addWidget(self._folder_lbl)
-        h.addWidget(self._btn_settings)
-        h.addWidget(self._btn_theme)
-
-        # Internal rescan-enabled state, formerly tied to `_btn_rescan`,
-        # is now consulted by `_on_open_settings` only when needed.
-        self._can_rescan = False
-
         return w
 
     def _build_action_bar(self) -> QWidget:
-        """Three groups cleanly separated: Image Cover | Metadata | Tags/Playlist."""
+        """Four flat groups separated by hairlines: Cover Art | Metadata |
+        Tags / Playlist | Lyrics. One primary (accent) button per group,
+        secondary gray buttons, red-text destructive buttons."""
         w = QWidget()
         w.setObjectName('actionBar')
+        w.setAttribute(Qt.WA_StyledBackground, True)
 
         outer = QHBoxLayout(w)
-        outer.setContentsMargins(24, 16, 24, 16)
-        outer.setSpacing(16)
+        outer.setContentsMargins(20, 10, 20, 10)
+        outer.setSpacing(14)
+        n = self._action_icon_px
+        ic = self._icon_color()
+        red = self._theme.get('red', '#ff3b30')
 
-        # ── Group 1: Image Cover ─────────────────────────────────────────────
-        self._grp_covers = grp1 = QFrame()
-        grp1.setObjectName('actionGroup')
-        g1 = QVBoxLayout(grp1)
-        g1.setContentsMargins(20, 14, 20, 16)
-        g1.setSpacing(6)
+        def _group(caption: str) -> tuple[QFrame, QVBoxLayout, QHBoxLayout, QHBoxLayout]:
+            frame = QFrame()
+            frame.setObjectName('actionGroup')
+            g = QVBoxLayout(frame)
+            g.setContentsMargins(0, 0, 0, 0)
+            g.setSpacing(6)
+            cap_row = QHBoxLayout()
+            cap_row.setSpacing(10)
+            cap = QLabel(caption)
+            cap.setObjectName('groupLabel')
+            cap_row.addWidget(cap)
+            cap_row.addStretch()
+            g.addLayout(cap_row)
+            row = QHBoxLayout()
+            row.setSpacing(6)
+            g.addLayout(row)
+            return frame, g, cap_row, row
 
-        grp1_label = QLabel('IMAGE COVER')
-        grp1_label.setObjectName('groupLabel')
-        g1.addWidget(grp1_label)
+        def _btn(text: str, name: str, icon: str, color: str, tip: str, slot=None) -> AutoFitButton:
+            b = AutoFitButton(text)
+            b.setObjectName(name)
+            b.setIcon(get_icon(icon, n, color))
+            b.setIconSize(QSize(n, n))
+            b.setToolTip(tip)
+            b.setCursor(Qt.PointingHandCursor)
+            if slot is not None:
+                b.clicked.connect(slot)
+            return b
 
-        row1 = QHBoxLayout()
-        row1.setSpacing(6)
+        def _sep() -> QFrame:
+            line = QFrame()
+            line.setObjectName('groupSeparator')
+            line.setFrameShape(QFrame.VLine)
+            line.setFixedWidth(1)
+            return line
 
-        self._btn_auto = AutoFitButton('Auto Assign')
-        self._btn_auto.setObjectName('btnAutoAssign')
-        self._btn_auto.setIcon(get_icon('bolt', 28, '#ffffff'))
-        self._btn_auto.setIconSize(QSize(28, 28))
-        self._btn_auto.setToolTip('Auto-assign cover art')
+        # ── Group 1: Cover Art ───────────────────────────────────────────────
+        self._grp_covers, _, _, row1 = _group('Cover Art')
+        self._btn_auto = _btn('Auto Assign', 'btnAutoAssign', 'bolt', '#ffffff',
+                              'Auto-assign cover art')
         auto_menu = QMenu(self)
         auto_menu.addAction('Auto Assign Selected (missing)', self._on_auto_assign_selected)
         auto_menu.addAction('Auto Assign All Songs (missing)', self._on_auto_assign_all)
         self._btn_auto.setMenu(auto_menu)
-
-        self._btn_specific = AutoFitButton('Assign Specific')
-        self._btn_specific.setObjectName('btnAssignSpecific')
-        self._btn_specific.setIcon(get_icon('search', 28, '#ffffff'))
-        self._btn_specific.setIconSize(QSize(28, 28))
-        self._btn_specific.setToolTip('Search and pick from 6 candidates for the selected song.')
-        self._btn_specific.clicked.connect(self._on_assign_specific)
-
-        self._btn_delete = AutoFitButton('Delete')
-        self._btn_delete.setObjectName('btnDeleteCover')
-        self._btn_delete.setIcon(get_icon('trash', 28, '#ffffff'))
-        self._btn_delete.setIconSize(QSize(28, 28))
-        self._btn_delete.setToolTip('Remove embedded cover art from selected song(s).')
-        self._btn_delete.clicked.connect(self._on_delete_cover)
-
+        self._btn_specific = _btn('Specific', 'btnAssignSpecific', 'search', ic,
+                                  'Search and pick from 6 candidates for the selected song.',
+                                  self._on_assign_specific)
+        self._btn_delete = _btn('Delete', 'btnDeleteCover', 'trash', red,
+                                'Remove embedded cover art from selected song(s).',
+                                self._on_delete_cover)
         row1.addWidget(self._btn_auto)
         row1.addWidget(self._btn_specific)
         row1.addWidget(self._btn_delete)
-        g1.addLayout(row1)
-
-        outer.addWidget(grp1, 1)
+        outer.addWidget(self._grp_covers, 3)
+        outer.addWidget(_sep())
 
         # ── Group 2: Metadata ────────────────────────────────────────────────
-        self._grp_meta = grp2 = QFrame()
-        grp2.setObjectName('actionGroup')
-        g2 = QVBoxLayout(grp2)
-        g2.setContentsMargins(20, 14, 20, 16)
-        g2.setSpacing(6)
-
-        grp2_lbl_row = QHBoxLayout()
-        grp2_lbl_row.setSpacing(0)
-        grp2_label = QLabel('METADATA')
-        grp2_label.setObjectName('groupLabel')
-        grp2_lbl_row.addWidget(grp2_label)
-        grp2_lbl_row.addStretch()
-        self._hint_lbl = QLabel('← Select a song')
+        self._grp_meta, _, cap2, row2 = _group('Metadata')
+        self._hint_lbl = ElidedLabel('No selection — actions apply to all songs')
         self._hint_lbl.setObjectName('actionHint')
-        grp2_lbl_row.addWidget(self._hint_lbl)
-        g2.addLayout(grp2_lbl_row)
-
-        row2 = QHBoxLayout()
-        row2.setSpacing(6)
-
-        self._btn_fix_auto = AutoFitButton('Try to auto detect')
-        self._btn_fix_auto.setObjectName('btnFixMeta')
-        self._btn_fix_auto.setIcon(get_icon('wand', 28, '#ffffff'))
-        self._btn_fix_auto.setIconSize(QSize(28, 28))
-        self._btn_fix_auto.setToolTip(
-            'Parse "Artist - Title (Album)" from each filename.\n'
-            'Content in parentheses is set as the album tag.\n'
-            'Operates on selected songs, or all songs if none selected.'
-        )
-        self._btn_fix_auto.clicked.connect(self._on_fix_auto)
-
-        self._btn_fix_manual = AutoFitButton('Manual Fix')
-        self._btn_fix_manual.setObjectName('btnFixMetaManual')
-        self._btn_fix_manual.setIcon(get_icon('pencil', 28, '#ffffff'))
-        self._btn_fix_manual.setIconSize(QSize(28, 28))
-        self._btn_fix_manual.setToolTip(
-            'Preview and edit all proposed metadata changes before applying.'
-        )
-        self._btn_fix_manual.clicked.connect(self._on_fix_manual)
-
-        self._btn_clear_meta = AutoFitButton('Clear')
-        self._btn_clear_meta.setObjectName('btnClearMeta')
-        self._btn_clear_meta.setIcon(get_icon('x_mark', 24, self._icon_color()))
-        self._btn_clear_meta.setIconSize(QSize(24, 24))
-        self._btn_clear_meta.setToolTip(
-            'Remove title, artist and album tags from selected song(s).\n'
-            'Nothing selected: clears ALL songs.'
-        )
-        self._btn_clear_meta.clicked.connect(self._on_clear_meta)
-
+        self._hint_lbl.setElideMode(Qt.ElideRight)
+        self._hint_lbl.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        cap2.addWidget(self._hint_lbl, 1)
+        self._btn_fix_auto = _btn('Auto Detect', 'btnFixMeta', 'wand', '#ffffff',
+                                  'Parse "Artist - Title (Album)" from each filename.\n'
+                                  'Content in parentheses is set as the album tag.\n'
+                                  'Operates on selected songs, or all songs if none selected.',
+                                  self._on_fix_auto)
+        self._btn_fix_manual = _btn('Manual', 'btnFixMetaManual', 'pencil', ic,
+                                    'Preview and edit all proposed metadata changes before applying.',
+                                    self._on_fix_manual)
+        self._btn_trim = _btn('Trim', 'btnTrim', 'scissors', ic,
+                              'Cut part of the selected song (e.g. an unexpected ending).\n'
+                              'The original file is overwritten after two confirmations.',
+                              self._on_trim_song)
+        self._btn_clear_meta = _btn('Clear', 'btnClearMeta', 'x_mark', red,
+                                    'Remove title, artist and album tags from selected song(s).\n'
+                                    'Nothing selected: clears ALL songs.',
+                                    self._on_clear_meta)
         row2.addWidget(self._btn_fix_auto)
         row2.addWidget(self._btn_fix_manual)
+        row2.addWidget(self._btn_trim)
         row2.addWidget(self._btn_clear_meta)
-        g2.addLayout(row2)
-
-        outer.addWidget(grp2, 1)
+        outer.addWidget(self._grp_meta, 4)
+        outer.addWidget(_sep())
 
         # ── Group 3: Tags / Playlist ─────────────────────────────────────────
-        self._grp_tags = grp3 = QFrame()
-        grp3.setObjectName('actionGroup')
-        g3 = QVBoxLayout(grp3)
-        g3.setContentsMargins(20, 14, 20, 16)
-        g3.setSpacing(6)
-
-        grp3_lbl_row = QHBoxLayout()
-        grp3_lbl_row.setSpacing(0)
-        grp3_label = QLabel('TAGS / PLAYLIST')
-        grp3_label.setObjectName('groupLabel')
-        grp3_lbl_row.addWidget(grp3_label)
-        grp3_lbl_row.addStretch()
-        self._playlist_info_lbl = QLabel('')
+        self._grp_tags, _, cap3, row3 = _group('Tags / Playlist')
+        self._playlist_info_lbl = ElidedLabel('')
         self._playlist_info_lbl.setObjectName('playlistInfo')
-        grp3_lbl_row.addWidget(self._playlist_info_lbl)
-        g3.addLayout(grp3_lbl_row)
-
-        row3 = QHBoxLayout()
-        row3.setSpacing(6)
-
-        # JSON-picker moved into Settings dialog; this group keeps only the
-        # tag-action buttons (Assign Tags / JSON Report / Fix Unsupported Tags
-        # / Remove from JSON).
-
-        self._btn_playlist_assign = AutoFitButton('Assign Tags')
-        self._btn_playlist_assign.setObjectName('btnPlaylistAssign')
-        self._btn_playlist_assign.setIcon(get_icon('tag', 28, '#ffffff'))
-        self._btn_playlist_assign.setIconSize(QSize(28, 28))
-        self._btn_playlist_assign.setToolTip(
-            'Assign one or more tags to the selected songs.'
-        )
-        self._btn_playlist_assign.clicked.connect(self._on_assign_playlists)
-
-        self._btn_playlist_report = AutoFitButton('JSON Report')
-        self._btn_playlist_report.setObjectName('btnPlaylistReport')
-        self._btn_playlist_report.setIcon(get_icon('list', 28, self._icon_color()))
-        self._btn_playlist_report.setIconSize(QSize(28, 28))
-        self._btn_playlist_report.setToolTip(
-            'Show detailed mismatch and JSON diagnostics.'
-        )
-        self._btn_playlist_report.clicked.connect(self._on_show_playlist_report)
-
-        self._btn_remove_missing = AutoFitButton('Remove from JSON')
-        self._btn_remove_missing.setObjectName('btnRemoveMissing')
-        self._btn_remove_missing.setIcon(get_icon('trash', 28, '#ffffff'))
-        self._btn_remove_missing.setIconSize(QSize(28, 28))
-        self._btn_remove_missing.setToolTip(
-            'Delete the selected missing entries from the JSON file.\n'
-            'Only available when Missing filter is active and ghost rows are selected.'
-        )
-        self._btn_remove_missing.clicked.connect(self._on_remove_missing_records)
-        self._btn_remove_missing.setVisible(False)
-
-        self._btn_fix_invalid_tags = AutoFitButton('Fix Unsupported Tags')
-        self._btn_fix_invalid_tags.setObjectName('btnFixInvalidTags')
-        self._btn_fix_invalid_tags.setIcon(get_icon('wand', 28, '#ffffff'))
-        self._btn_fix_invalid_tags.setIconSize(QSize(28, 28))
-        self._btn_fix_invalid_tags.setToolTip(
-            'Remap each unsupported tag found in the JSON to a valid '
-            'identifier (the stem of a PNG in Data/Tags/), or remove it.'
-        )
-        self._btn_fix_invalid_tags.clicked.connect(self._on_fix_unsupported_tags)
+        self._playlist_info_lbl.setElideMode(Qt.ElideRight)
+        self._playlist_info_lbl.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        cap3.addWidget(self._playlist_info_lbl, 1)
+        self._btn_playlist_assign = _btn('Assign Tags', 'btnPlaylistAssign', 'tag', '#ffffff',
+                                         'Assign one or more tags to the selected songs.',
+                                         self._on_assign_playlists)
+        self._btn_playlist_report = _btn('Sync Check', 'btnPlaylistReport', 'heart_pulse', ic,
+                                         'Review every difference between the JSON, the music folder and the\n'
+                                         'lyrics folder (case/spacing drift, duplicates, missing files) and\n'
+                                         'apply the JSON fixes in one go.',
+                                         self._on_show_playlist_report)
+        self._btn_fix_invalid_tags = _btn('Fix Tags', 'btnFixInvalidTags', 'wand', ic,
+                                          'Remap each unsupported tag found in the JSON to a valid\n'
+                                          'identifier (the stem of a PNG in Data/Tags/), or remove it.',
+                                          self._on_fix_unsupported_tags)
         self._btn_fix_invalid_tags.setEnabled(False)
-
+        self._btn_remove_missing = _btn('Remove Entry', 'btnRemoveMissing', 'trash', red,
+                                        'Delete the selected missing entries from the JSON file.\n'
+                                        'Only available when Missing filter is active and ghost rows are selected.',
+                                        self._on_remove_missing_records)
+        self._btn_remove_missing.setVisible(False)
         row3.addWidget(self._btn_playlist_assign)
         row3.addWidget(self._btn_playlist_report)
         row3.addWidget(self._btn_fix_invalid_tags)
         row3.addWidget(self._btn_remove_missing)
-        g3.addLayout(row3)
-
-        outer.addWidget(grp3, 1)
+        outer.addWidget(self._grp_tags, 3)
+        outer.addWidget(_sep())
 
         # ── Group 4: Lyrics ──────────────────────────────────────────────────
-        self._grp_lyrics = grp_lyrics = QFrame()
-        grp_lyrics.setObjectName('actionGroup')
-        g4 = QVBoxLayout(grp_lyrics)
-        g4.setContentsMargins(20, 14, 20, 16)
-        g4.setSpacing(6)
-
-        grp4_lbl_row = QHBoxLayout()
-        grp4_lbl_row.setSpacing(0)
-        grp4_label = QLabel('LYRICS')
-        grp4_label.setObjectName('groupLabel')
-        grp4_lbl_row.addWidget(grp4_label)
-        grp4_lbl_row.addStretch()
-        g4.addLayout(grp4_lbl_row)
-
-        row4 = QHBoxLayout()
-        row4.setSpacing(6)
-
-        # Lyrics folder picker lives in Settings dialog now; this group keeps
-        # only the lyrics-action buttons (Fetch Online / Import .lrc / Remove).
-
-        self._btn_lyrics_fetch = AutoFitButton('Fetch Online')
-        self._btn_lyrics_fetch.setObjectName('btnLyricsFetch')
-        self._btn_lyrics_fetch.setIcon(get_icon('search', 28, '#ffffff'))
-        self._btn_lyrics_fetch.setIconSize(QSize(28, 28))
-        self._btn_lyrics_fetch.setToolTip(
-            'Download lyrics from LRCLIB for selected songs (or all songs '
-            'without lyrics if none selected).'
-        )
-        self._btn_lyrics_fetch.clicked.connect(self._on_fetch_lyrics)
-
-        self._btn_lyrics_import = AutoFitButton('Import .lrc')
-        self._btn_lyrics_import.setObjectName('btnLyricsImport')
-        self._btn_lyrics_import.setIcon(get_icon('document', 28, '#ffffff'))
-        self._btn_lyrics_import.setIconSize(QSize(28, 28))
-        self._btn_lyrics_import.setToolTip(
-            'Pick an .lrc file from disk and copy it into the lyrics folder '
-            'under the canonical name for the selected song.'
-        )
-        self._btn_lyrics_import.clicked.connect(self._on_import_lyrics)
-
-        self._btn_lyrics_remove = AutoFitButton('Remove')
-        self._btn_lyrics_remove.setObjectName('btnLyricsRemove')
-        self._btn_lyrics_remove.setIcon(get_icon('trash', 28, '#ffffff'))
-        self._btn_lyrics_remove.setIconSize(QSize(28, 28))
-        self._btn_lyrics_remove.setToolTip(
-            'Delete the .lrc file(s) for the selected songs.'
-        )
-        self._btn_lyrics_remove.clicked.connect(self._on_remove_lyrics)
-
+        self._grp_lyrics, _, _, row4 = _group('Lyrics')
+        self._btn_lyrics_fetch = _btn('Fetch', 'btnLyricsFetch', 'search', '#ffffff',
+                                      'Download lyrics (LRCLIB → NetEase → lyrics.ovh) for the selected\n'
+                                      'songs, or every song without lyrics if none selected. Runs in the\n'
+                                      'background. Selecting songs marked "not found online" retries them.',
+                                      self._on_fetch_lyrics)
+        self._btn_lyrics_import = _btn('Import', 'btnLyricsImport', 'document', ic,
+                                       'Pick an .lrc file from disk and copy it into the lyrics folder\n'
+                                       'under the canonical name for the selected song.',
+                                       self._on_import_lyrics)
+        self._btn_lyrics_remove = _btn('Remove', 'btnLyricsRemove', 'trash', red,
+                                       'Delete the .lrc file(s) for the selected songs.',
+                                       self._on_remove_lyrics)
         row4.addWidget(self._btn_lyrics_fetch)
         row4.addWidget(self._btn_lyrics_import)
         row4.addWidget(self._btn_lyrics_remove)
-        g4.addLayout(row4)
+        outer.addWidget(self._grp_lyrics, 3)
 
-        outer.addWidget(grp_lyrics, 1)
-
-        for btn in (
+        self._action_buttons = (
             self._btn_auto, self._btn_specific, self._btn_delete,
-            self._btn_fix_auto, self._btn_fix_manual, self._btn_clear_meta,
+            self._btn_fix_auto, self._btn_fix_manual, self._btn_trim, self._btn_clear_meta,
             self._btn_playlist_assign, self._btn_playlist_report,
             self._btn_fix_invalid_tags, self._btn_remove_missing,
-            self._btn_lyrics_fetch,
-            self._btn_lyrics_import, self._btn_lyrics_remove,
-        ):
-            btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-            btn.setMinimumHeight(52)
+            self._btn_lyrics_fetch, self._btn_lyrics_import, self._btn_lyrics_remove,
+        )
+        self._action_groups = (
+            (self._grp_covers, (self._btn_auto, self._btn_specific, self._btn_delete)),
+            (self._grp_meta, (self._btn_fix_auto, self._btn_fix_manual, self._btn_trim, self._btn_clear_meta)),
+            (self._grp_tags, (self._btn_playlist_assign, self._btn_playlist_report,
+                              self._btn_fix_invalid_tags, self._btn_remove_missing)),
+            (self._grp_lyrics, (self._btn_lyrics_fetch, self._btn_lyrics_import, self._btn_lyrics_remove)),
+        )
+        for btn in self._action_buttons:
+            # Ignored: the layout shares the row by stretch factor instead of
+            # by label width; the fitter / icon-only mode keeps labels legible.
+            btn.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+            btn.setMinimumWidth(40)
+            btn.setMinimumHeight(ACTION_BTN_H)
+            btn.setMaximumHeight(ACTION_BTN_H)
 
         return w
 
@@ -1121,8 +1459,6 @@ class MainWindow(QMainWindow):
         v = QVBoxLayout(container)
         v.setContentsMargins(0, 0, 0, 0)
         v.setSpacing(0)
-
-        v.addWidget(self._build_table_bar())
 
         self._stack = QStackedWidget()
         self._table = self._build_table()
@@ -1143,58 +1479,6 @@ class MainWindow(QMainWindow):
 
         return container
 
-    def _build_table_bar(self) -> QWidget:
-        """Thin bar above the song list: hint + List/Grid toggle."""
-        w = QWidget()
-        w.setObjectName('tableBar')
-        w.setFixedHeight(60)
-
-        h = QHBoxLayout(w)
-        h.setContentsMargins(20, 0, 14, 0)
-        h.setSpacing(8)
-
-        self._search_bar = QLineEdit()
-        self._search_bar.setObjectName('searchBar')
-        self._search_bar.setPlaceholderText('Search songs…')
-        self._search_bar.setFixedHeight(36)
-        self._search_bar.setMinimumWidth(180)
-        self._search_bar.setMaximumWidth(320)
-        self._search_bar.setClearButtonEnabled(True)
-        self._search_bar.textChanged.connect(self._on_search_changed)
-        h.addWidget(self._search_bar)
-
-        h.addStretch(1)
-
-        self._filter_title_lbl = QLabel('All Songs')
-        self._filter_title_lbl.setObjectName('filterTitle')
-        self._filter_title_lbl.setAlignment(Qt.AlignCenter)
-        h.addWidget(self._filter_title_lbl)
-
-        h.addStretch(1)
-
-        view_lbl = QLabel('View:')
-        view_lbl.setStyleSheet('color:#4a5568; font-size:12px;')
-        h.addWidget(view_lbl)
-
-        self._btn_view_list = QPushButton('List')
-        self._btn_view_list.setObjectName('btnViewActive')
-        self._btn_view_list.setIcon(get_icon('list', 24, '#ffffff'))
-        self._btn_view_list.setIconSize(QSize(24, 24))
-        self._btn_view_list.setFixedSize(140, 42)
-        self._btn_view_list.clicked.connect(lambda: self._on_set_view('list'))
-
-        self._btn_view_grid = QPushButton('Grid')
-        self._btn_view_grid.setObjectName('btnViewInactive')
-        self._btn_view_grid.setIcon(get_icon('grid', 24, self._icon_color()))
-        self._btn_view_grid.setIconSize(QSize(24, 24))
-        self._btn_view_grid.setFixedSize(140, 42)
-        self._btn_view_grid.clicked.connect(lambda: self._on_set_view('grid'))
-
-        h.addWidget(self._btn_view_list)
-        h.addWidget(self._btn_view_grid)
-
-        return w
-
     def _build_table(self) -> SongTable:
         t = SongTable(0, 10)
         t.setHorizontalHeaderLabels(
@@ -1208,6 +1492,7 @@ class MainWindow(QMainWindow):
         t.verticalHeader().setVisible(False)
         t.verticalHeader().setSectionResizeMode(QHeaderView.Fixed)
         t.setShowGrid(False)
+        t.setWordWrap(False)     # elide long names instead of wrapping rows
         t.setIconSize(QSize(THUMB_SIZE, THUMB_SIZE))
         t.setSortingEnabled(True)
 
@@ -1294,45 +1579,66 @@ class MainWindow(QMainWindow):
         new_key = THEME_ORDER[(idx + 1) % len(THEME_ORDER)]
         self._theme = THEMES[new_key]
         self._settings.setValue('theme', new_key)
-        QApplication.instance().setStyleSheet(build_stylesheet(self._theme))
+        QApplication.instance().setStyleSheet(build_stylesheet(self._theme, self._ui_scale))
         self._update_theme_icon()
         self._refresh_button_icons()
         self._player_bar.update_icon_colors(
             self._theme['text'], self._theme['accent']
         )
-        # Re-theme the new widgets that aren't reached by the global QSS.
+        # Re-theme the widgets that aren't reached by the global QSS.
         for sec in getattr(self, '_stat_sections', ()):
             sec.apply_theme(self._theme)
+        if hasattr(self, '_lyrics_progress'):
+            self._lyrics_progress.apply_theme(self._theme)
+        if hasattr(self, '_theme_name_lbl'):
+            self._theme_name_lbl.setText(self._theme['name'])
         if hasattr(self, '_settings_panel'):
             self._settings_panel.apply_theme(self._theme)
+        fade_in(self._main_stack.currentWidget(), 220, 0.6)
 
     def _update_theme_icon(self):
-        self._btn_theme.setIcon(get_icon('palette', 28, self._icon_color()))
-        self._btn_theme.setIconSize(QSize(28, 28))
-        self._btn_theme.setToolTip(f'Theme: {self._theme["name"]}')
+        px = max(1, int(round(18 * getattr(self, '_ui_scale', 1.0))))
+        self._btn_theme.setIcon(get_icon('palette', px, self._theme['accent']))
+        self._btn_theme.setIconSize(QSize(px, px))
+        self._btn_theme.setToolTip(f'Theme: {self._theme["name"]} — click to switch')
 
     def _refresh_button_icons(self):
-        """Re-tint all button icons after a theme change."""
+        """Re-tint (and re-size) all button icons after a theme or scale
+        change. Primary buttons keep white icons; secondary/destructive ones
+        follow the text colour."""
         ic = self._icon_color()
-        # header
-        self._btn_settings.setIcon(get_icon('gear', 22, ic))
-        # action bar – colored-bg buttons keep white icons
-        self._btn_auto.setIcon(get_icon('bolt', 28, '#ffffff'))
-        self._btn_specific.setIcon(get_icon('search', 28, '#ffffff'))
-        self._btn_delete.setIcon(get_icon('trash', 28, '#ffffff'))
-        self._btn_fix_auto.setIcon(get_icon('wand', 28, '#ffffff'))
-        self._btn_fix_manual.setIcon(get_icon('pencil', 28, '#ffffff'))
-        self._btn_clear_meta.setIcon(get_icon('x_mark', 24, ic))
-        self._btn_playlist_assign.setIcon(get_icon('tag', 28, '#ffffff'))
-        self._btn_playlist_report.setIcon(get_icon('list', 28, ic))
+        red = self._theme.get('red', '#ff3b30')
+        n = self._action_icon_px
+        sc = lambda v: max(1, int(round(v * self._ui_scale)))
+        self._btn_settings.setIcon(get_icon('gear', sc(18), ic))
+        self._btn_settings.setIconSize(QSize(sc(18), sc(18)))
+        self._search_bar.actions()[0].setIcon(get_icon('search', sc(14), ic))
+        for b in (self._btn_view_list, self._btn_view_grid, self._btn_sequenze):
+            b.setIconSize(QSize(sc(14), sc(14)))
+        for btn in self._action_buttons:
+            btn.setIconSize(QSize(n, n))
+        # primary
+        self._btn_auto.setIcon(get_icon('bolt', n, '#ffffff'))
+        self._btn_fix_auto.setIcon(get_icon('wand', n, '#ffffff'))
+        self._btn_playlist_assign.setIcon(get_icon('tag', n, '#ffffff'))
+        self._btn_lyrics_fetch.setIcon(get_icon('search', n, '#ffffff'))
+        self._btn_sequenze.setIcon(get_icon('pencil', sc(14), '#ffffff'))
+        # secondary
+        self._btn_specific.setIcon(get_icon('search', n, ic))
+        self._btn_fix_manual.setIcon(get_icon('pencil', n, ic))
+        self._btn_playlist_report.setIcon(get_icon('heart_pulse', n, ic))
+        self._btn_fix_invalid_tags.setIcon(get_icon('wand', n, ic))
+        self._btn_lyrics_import.setIcon(get_icon('document', n, ic))
+        self._btn_trim.setIcon(get_icon('scissors', n, ic))
+        # destructive
+        self._btn_delete.setIcon(get_icon('trash', n, red))
+        self._btn_clear_meta.setIcon(get_icon('x_mark', n, red))
+        self._btn_remove_missing.setIcon(get_icon('trash', n, red))
+        self._btn_lyrics_remove.setIcon(get_icon('trash', n, red))
         # view toggle
         is_list = self._stack.currentIndex() == 0
-        self._btn_view_list.setIcon(
-            get_icon('list', 24, '#ffffff' if is_list else ic)
-        )
-        self._btn_view_grid.setIcon(
-            get_icon('grid', 24, '#ffffff' if not is_list else ic)
-        )
+        self._btn_view_list.setIcon(get_icon('list', sc(14), '#ffffff' if is_list else ic))
+        self._btn_view_grid.setIcon(get_icon('grid', sc(14), '#ffffff' if not is_list else ic))
 
     # =========================================================================
     # Playlist JSON helpers
@@ -1414,13 +1720,16 @@ class MainWindow(QMainWindow):
             real_songs,
             self._folder,
             list(self._tag_icons.keys()),
+            self._lyrics_store,
         )
         worker.result_ready.connect(
-            lambda done_seq, result, old_paths=previous_paths: self._on_playlist_reconcile_complete(
-                done_seq,
-                result,
-                old_paths,
-            )
+            lambda done_seq, result, health_issues, old_paths=previous_paths:
+                self._on_playlist_reconcile_complete(
+                    done_seq,
+                    result,
+                    old_paths,
+                    health_issues,
+                )
         )
         worker.error.connect(self._on_playlist_reconcile_error)
         worker.finished.connect(self._on_playlist_reconcile_worker_finished)
@@ -1432,6 +1741,7 @@ class MainWindow(QMainWindow):
         seq: int,
         result: dict,
         previous_paths: set[str],
+        health_issues: list,
     ):
         if seq != self._playlist_reconcile_seq:
             return
@@ -1439,7 +1749,10 @@ class MainWindow(QMainWindow):
         t0 = _time.perf_counter()
         previous_issue_paths = set(self._playlist_issues_by_path.keys())
         self._playlist_store.apply_reconcile_result(result, self._songs, self._folder)
-        self._rebuild_playlist_issue_map()
+        # The audit (build_health_report) already ran on the worker thread —
+        # see PlaylistReconcileWorker — so this is just cheap dict-building
+        # from an already-materialized list, not a fresh O(n²) analysis.
+        self._rebuild_playlist_issue_map(health_issues)
         self._sync_ghost_rows()
         self._playlist_reconcile_applied_seq = seq
 
@@ -1499,7 +1812,8 @@ class MainWindow(QMainWindow):
     def _update_playlist_labels(self):
         # Path label moved into Settings dialog; just keep the in-group
         # summary line current.
-        self._playlist_info_lbl.setText(self._playlist_store.summary())
+        self._playlist_info_lbl.set_full_text(self._playlist_store.summary())
+        self._playlist_info_lbl.setToolTip(self._playlist_store.summary())
         # Push the latest path into Settings (if the dialog is open).
         self._sync_settings_paths()
 
@@ -1563,11 +1877,11 @@ class MainWindow(QMainWindow):
         """Switch the central stack to the Settings page."""
         # Bring the panel up to date before showing it.
         self._sync_settings_paths()
-        self._main_stack.setCurrentIndex(1)
+        fade_to(self._main_stack, 1)
 
     def _on_settings_close(self):
         """Close button: return to the library and run any deferred sync."""
-        self._main_stack.setCurrentIndex(0)
+        fade_to(self._main_stack, 0)
         self._run_pending_sync()
 
     def _sync_settings_paths(self):
@@ -1598,6 +1912,18 @@ class MainWindow(QMainWindow):
         self._settings.setValue('lyrics_folder', folder)
         self._pending_lyrics_scan = True
         self._sync_settings_paths()
+        # A running download simply continues into the new folder.
+        if self._lyrics_fetch_worker and self._lyrics_fetch_worker.isRunning():
+            self._lyrics_fetch_worker.retarget(folder)
+            self._status_lbl.setText('Lyrics download continues into the new folder…')
+
+    def _lyrics_auto_enabled(self) -> bool:
+        return str(self._settings.value('lyrics_auto_fetch', 'true')).lower() in ('true', '1', 'yes')
+
+    def _on_auto_lyrics_toggled(self, enabled: bool):
+        self._settings.setValue('lyrics_auto_fetch', 'true' if enabled else 'false')
+        if enabled and self._songs and not self._is_scanning:
+            self._maybe_auto_fetch_lyrics()
 
     def _on_settings_music_refresh(self):
         if self._folder:
@@ -1678,7 +2004,9 @@ class MainWindow(QMainWindow):
         if self._pending_lyrics_scan:
             self._pending_lyrics_scan = False
             self._lyrics_store.scan(self._songs)
+            self._request_playlist_reconcile()   # health report depends on lyrics
             self._update_stats()
+            self._maybe_auto_fetch_lyrics()
 
     # =========================================================================
     # Slots – folder
@@ -1745,11 +2073,16 @@ class MainWindow(QMainWindow):
             record = self._playlist_store._path_to_record.get(ghost_path)
             if record is None:
                 continue
-            try:
-                idx = self._playlist_store.records.index(record)
+            # Identity lookup, not list.index() (value equality): two ghost
+            # records commonly have identical content — same title, same
+            # (often empty) tags, e.g. two untagged missing entries, or a
+            # duplicate pair after a merge — and list.index() would then
+            # delete whichever one happens to come first, not the one the
+            # user actually selected. That left the real target untouched,
+            # so it kept reappearing as "missing" after every reconcile.
+            idx = self._playlist_store.record_index(record)
+            if idx >= 0:
                 indexes.append(idx)
-            except ValueError:
-                pass
 
         removed = self._playlist_store.remove_records_by_indexes(indexes)
         if not removed:
@@ -1757,9 +2090,7 @@ class MainWindow(QMainWindow):
 
         if self._save_playlist_store():
             self._reconcile_playlist_store()
-            self._status_lbl.setText(
-                f'Removed {removed} entr{"y" if removed == 1 else "ies"} from JSON.'
-            )
+            self._notify(f'Removed {removed} entr{"y" if removed == 1 else "ies"} from JSON.')
 
     def _on_show_playlist_report(self):
         if self._playlist_reconcile_pending:
@@ -1769,15 +2100,78 @@ class MainWindow(QMainWindow):
                 'Tag JSON matching is still in progress. Wait for it to finish, then open the report.',
             )
             return
-        dlg = PlaylistJsonReportDialog(
+        store = self._playlist_store
+        dlg = JsonHealthDialog(
             json_path=self._playlist_json_path,
-            summary=self._playlist_store.summary(),
-            mismatch_records=self._playlist_store.mismatch_records,
-            invalid_tag_records=self._playlist_store.invalid_tag_records,
-            image_decode_failures=get_decode_failures(),
+            issues=self._health_issues,
+            summary_text=store.summary(),
+            report_text=build_report_text(
+                store.mismatch_records, store.invalid_tag_records,
+                store.duplicate_records, get_decode_failures(),
+            ),
+            theme=self._theme,
             parent=self,
         )
         dlg.exec_()
+        if dlg.lyrics_changed:
+            self._lyrics_store.scan(self._songs)
+            for path in self._songs:
+                self._refresh_song_lyrics_cell(path)
+        if dlg.result_action == JsonHealthDialog.RESULT_APPLY:
+            self._on_apply_health_fixes(dlg.selected_fixes())
+        elif dlg.result_action == JsonHealthDialog.RESULT_OPEN_EDITOR:
+            path, suggestion = dlg.editor_request
+            if path in self._songs:
+                self._open_song_editor(start_path=path, initial_filename=suggestion)
+        elif dlg.result_action == JsonHealthDialog.RESULT_FIX_SPACING:
+            self._on_apply_spacing_fixes(dlg.spacing_fix_intents)
+        elif dlg.lyrics_changed:
+            self._request_playlist_reconcile()
+
+    def _on_apply_spacing_fixes(self, intents: dict):
+        """Apply the batch of spacing renames the user confirmed in
+        SpacingFixDialog. Reuses the same per-song rename path Edit Song
+        uses (file + JSON title + .lrc together), just for many files."""
+        if not intents:
+            return
+        selected = list(intents.keys())
+        _translated, renamed, failures = self._apply_rename_intents(selected, intents)
+        if renamed:
+            self._save_playlist_store()
+        msg = f'Fixed spacing on {renamed} file{"" if renamed == 1 else "s"}.'
+        if failures:
+            msg += f' {len(failures)} failed — see below.'
+        self._notify(msg)
+        if failures:
+            detail = '\n'.join(f'  • {name}: {reason}' for name, reason in failures[:15])
+            if len(failures) > 15:
+                detail += f'\n  … and {len(failures) - 15} more'
+            QMessageBox.warning(
+                self, 'Some Renames Failed',
+                f'{len(failures)} file(s) could not be renamed:\n\n{detail}',
+            )
+
+    def _on_apply_health_fixes(self, fixes: list):
+        if not fixes:
+            return
+        real_songs = {p: s for p, s in self._songs.items() if p not in self._ghost_paths}
+        try:
+            counts = apply_json_fixes(self._playlist_store, fixes, real_songs)
+        except Exception as exc:
+            QMessageBox.warning(self, 'Sync Check', f'Could not apply fixes:\n{exc}')
+            return
+        if not self._save_playlist_store():
+            return
+        parts = []
+        if counts.get('titles_synced'):
+            parts.append(f"synced {counts['titles_synced']} title(s) to disk names")
+        if counts.get('duplicates_merged'):
+            parts.append(f"merged {counts['duplicates_merged']} duplicate(s)")
+        if counts.get('relinked'):
+            parts.append(f"relinked {counts['relinked']} entr{'y' if counts['relinked'] == 1 else 'ies'}")
+        msg = 'JSON fixed — ' + (', '.join(parts) if parts else 'nothing needed changing') + '.'
+        self._status_lbl.setText(msg)
+        self._show_toast(msg)
 
     def _on_fix_unsupported_tags(self):
         if self._playlist_reconcile_pending:
@@ -1831,9 +2225,7 @@ class MainWindow(QMainWindow):
                 parts.append(f'remapped {renamed}')
             if removed:
                 parts.append(f'removed {removed}')
-            self._status_lbl.setText(
-                'Tag conversion saved (' + ', '.join(parts) + ').'
-            )
+            self._notify('Tag conversion saved (' + ', '.join(parts) + ').')
 
     # ── Lyrics handlers ──────────────────────────────────────────────────────
 
@@ -1852,82 +2244,151 @@ class MainWindow(QMainWindow):
         and the new Settings dialog."""
         self._lyrics_store.set_folder(folder)
         self._settings.setValue('lyrics_folder', folder)
+        if self._lyrics_fetch_worker and self._lyrics_fetch_worker.isRunning():
+            self._lyrics_fetch_worker.retarget(folder)
         self._lyrics_store.scan(self._songs)
         self._update_stats()
         self._sync_settings_paths()
         self._status_lbl.setText(
             f'Lyrics folder set — {self._lyrics_store.count} song(s) have lyrics.'
         )
+        self._maybe_auto_fetch_lyrics()
 
     def _on_fetch_lyrics(self):
+        """Manual fetch (button): selected songs, or every song without lyrics."""
         if not self._lyrics_store.get_folder():
             QMessageBox.information(
                 self, 'Fetch Lyrics',
-                'Pick a lyrics folder first ("Select Lyrics Folder").'
+                'Pick a lyrics folder first (Settings → Lyrics Folder).'
             )
             return
         if self._lyrics_fetch_worker and self._lyrics_fetch_worker.isRunning():
             QMessageBox.information(
                 self, 'Fetch Lyrics',
-                'A lyrics fetch is already running. Wait for it to finish.'
+                'A lyrics download is already running — it continues in the background.'
             )
             return
         selected = self._selected_paths()
         if selected:
             real_paths = [p for p in selected if p not in self._ghost_paths]
             targets = [self._songs[p] for p in real_paths if p in self._songs]
+            # An explicit request asks every source again, even for songs
+            # remembered as not found.
+            for song in targets:
+                self._lyrics_store.forget_miss(self._lyrics_store.miss_key_for_song(song))
+            self._lyrics_store.save_misses()
         else:
-            targets = [
-                self._songs[p] for p in self._songs
-                if p not in self._ghost_paths and not self._lyrics_store.has_lyrics(p)
-            ]
+            targets = self._lyrics_targets()
         if not targets:
             QMessageBox.information(
                 self, 'Fetch Lyrics',
                 'No songs to fetch — every selected song already has lyrics.'
             )
             return
-        reply = QMessageBox.question(
-            self, 'Fetch Lyrics',
-            f'Fetch lyrics from LRCLIB for {len(targets)} song(s)?\n\n'
-            f'This contacts lrclib.net once per song (~0.35s rate-limit).',
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
-        )
-        if reply != QMessageBox.Yes:
-            return
+        self._start_lyrics_fetch(targets, auto=False)
 
+    def _lyrics_targets(self) -> list[dict]:
+        return [
+            self._songs[p] for p in self._songs
+            if p not in self._ghost_paths and not self._lyrics_store.has_lyrics(p)
+        ]
+
+    def _maybe_auto_fetch_lyrics(self):
+        """Automatic mode: start (or continue) downloading lyrics for every
+        song that has none — no prompt, no dialog. Called after each scan and
+        whenever the lyrics folder changes, so it resumes on its own."""
+        if not self._lyrics_auto_enabled() or not self._lyrics_store.get_folder():
+            return
+        if self._is_scanning:
+            return
+        if self._lyrics_fetch_worker and self._lyrics_fetch_worker.isRunning():
+            return
+        targets = self._lyrics_targets()
+        if targets:
+            self._start_lyrics_fetch(targets, auto=True)
+
+    def _start_lyrics_fetch(self, targets: list[dict], auto: bool):
         worker = LyricsFetchWorker(targets, self._lyrics_store.get_folder())
         worker.song_done.connect(self._on_lyrics_song_done)
         worker.progress.connect(self._on_lyrics_progress)
-        worker.finished.connect(self._on_lyrics_fetch_finished)
-        worker.start()
+        worker.finished.connect(
+            lambda fetched, failed, skipped, w=worker:
+                self._on_lyrics_fetch_finished(w, fetched, failed, skipped)
+        )
         self._lyrics_fetch_worker = worker
+        self._lyrics_fetch_is_auto = auto
+        self._lyrics_fetch_total = len(targets)
+        self._lyrics_fetch_added = 0
+        worker.start()
         self._sb_pbar.setRange(0, len(targets))
         self._sb_pbar.setValue(0)
         self._sb_pbar.show()
-        self._status_lbl.setText(f'Fetching lyrics for {len(targets)} song(s)…')
+        label = 'Auto-fetching' if auto else 'Fetching'
+        self._status_lbl.setText(f'{label} lyrics for {len(targets)} song(s) in the background…')
+        self._set_lyrics_progress(0, len(targets))
+
+    def _cancel_lyrics_fetch(self):
+        worker = self._lyrics_fetch_worker
+        if worker and worker.isRunning():
+            worker.cancel()
+            worker.wait(1500)
+        self._set_lyrics_progress(None, None)
+
+    def _set_lyrics_progress(self, done, total):
+        """Sidebar progress pill (present after the GUI redesign); no-op before."""
+        pill = getattr(self, '_lyrics_progress', None)
+        if pill is not None:
+            pill.set_progress(done, total)
 
     def _on_lyrics_progress(self, current: int, total: int, name: str):
         self._sb_pbar.setRange(0, total)
         self._sb_pbar.setValue(current)
-        self._status_lbl.setText(f'Fetching lyrics ({current}/{total}) — {name}')
+        label = 'Auto-fetching' if self._lyrics_fetch_is_auto else 'Fetching'
+        self._status_lbl.setText(f'{label} lyrics ({current}/{total}) — {name}')
+        self._set_lyrics_progress(current, total)
 
-    def _on_lyrics_song_done(self, path: str, success: bool):
-        if success and path in self._songs:
+    def _on_lyrics_song_done(self, path: str, status: str):
+        if status in (LyricsFetchWorker.STATUS_OK, LyricsFetchWorker.STATUS_EXISTS) \
+                and path in self._songs:
             self._lyrics_store._paths_with_lyrics.add(path)
+            if status == LyricsFetchWorker.STATUS_OK:
+                self._lyrics_fetch_added = getattr(self, '_lyrics_fetch_added', 0) + 1
+            # Live row update; the counters refresh on a coalescing timer so a
+            # 3000-song library doesn't re-filter on every hit.
+            self._refresh_song_lyrics_cell(path)
+            self._schedule_lyrics_stats()
 
-    def _on_lyrics_fetch_finished(self, fetched: int, failed: int):
+    def _schedule_lyrics_stats(self):
+        if self._lyrics_stats_timer is None:
+            self._lyrics_stats_timer = QTimer(self)
+            self._lyrics_stats_timer.setSingleShot(True)
+            self._lyrics_stats_timer.timeout.connect(self._update_stats)
+        self._lyrics_stats_timer.start(400)
+
+    def _on_lyrics_fetch_finished(self, worker, fetched: int, failed: int, skipped: int):
+        if worker is not self._lyrics_fetch_worker:
+            worker.deleteLater()
+            return
         self._sb_pbar.hide()
+        self._set_lyrics_progress(None, None)
         self._lyrics_store.scan(self._songs)
         for path in self._songs:
             self._refresh_song_lyrics_cell(path)
+        self._request_playlist_reconcile()   # health report depends on lyrics
         self._update_stats()
-        self._status_lbl.setText(
-            f'Lyrics fetch complete — {fetched} added, {failed} failed.'
-        )
-        if self._lyrics_fetch_worker:
-            self._lyrics_fetch_worker.deleteLater()
-            self._lyrics_fetch_worker = None
+        added = getattr(self, '_lyrics_fetch_added', 0)
+        parts = [f'{added} added']
+        if failed:
+            parts.append(f'{failed} not found online (remembered — see the sidebar)')
+        if skipped:
+            parts.append(f'{skipped} skipped (no artist/title to search)')
+        msg = (f'Lyrics {"auto-" if self._lyrics_fetch_is_auto else ""}fetch done — '
+               + ', '.join(parts) + '.')
+        self._status_lbl.setText(msg)
+        if added or not self._lyrics_fetch_is_auto:
+            self._show_toast(msg)
+        worker.deleteLater()
+        self._lyrics_fetch_worker = None
 
     def _on_import_lyrics(self):
         if not self._lyrics_store.get_folder():
@@ -1969,9 +2430,7 @@ class MainWindow(QMainWindow):
             return
         self._refresh_song_lyrics_cell(song_path)
         self._update_stats()
-        self._status_lbl.setText(
-            f'Imported lyrics for {self._songs[song_path].get("filename", song_path)}.'
-        )
+        self._notify(f'Imported lyrics for {self._songs[song_path].get("filename", song_path)}.')
 
     def _on_remove_lyrics(self):
         if not self._lyrics_store.get_folder():
@@ -2006,19 +2465,22 @@ class MainWindow(QMainWindow):
         for p in targets:
             self._refresh_song_lyrics_cell(p)
         self._update_stats()
-        self._status_lbl.setText(f'Removed lyrics for {removed} song(s).')
+        self._notify(f'Removed lyrics for {removed} song(s).')
 
     # ── Sequenze ─────────────────────────────────────────────────────────────
 
     _FILTER_DISPLAY_NAMES = {
         'all':          'All songs',
+        'new_song':     'New songs',
         'no_cover':     'No Cover',
         'no_meta':      'No metadata',
         'typo_errors':  'Typo errors',
         'no_tags':      'No tags',
-        'mismatch':     'JSON errors',
+        'health':       'Sync issues',
+        'mismatch':     'Invalid tags',
         'missing_file': 'Missing entries',
         'no_lyrics':    'No Lyrics',
+        'lyrics_not_found': 'Not found online',
     }
 
     def _filter_display_name(self) -> str:
@@ -2030,7 +2492,17 @@ class MainWindow(QMainWindow):
             return record.get('filename', '') or ''
         return ''
 
+    def _json_title_for_path(self, path: str) -> str:
+        """Exact JSON ``title`` for a song ('' when the song has no entry)."""
+        record = self._playlist_store._path_to_record.get(path)
+        if record:
+            return record.get('title', '') or ''
+        return ''
+
     def _on_sequenze(self):
+        self._open_song_editor()
+
+    def _open_song_editor(self, start_path: str = '', initial_filename: str = ''):
         # Collect rows currently visible under the active filter, in table order.
         visible_paths = []
         for row in range(self._table.rowCount()):
@@ -2052,14 +2524,22 @@ class MainWindow(QMainWindow):
         if not songs:
             return
 
-        # Start at the currently-selected song if it's in the visible set;
-        # otherwise fall back to the first visible song.
+        # Start at the requested song, else the currently-selected song if
+        # it's in the visible set, else the first visible song.
         start_index = 0
-        for p in self._selected_paths():
-            if p in visible_paths:
-                start_index = visible_paths.index(p)
-                break
+        if start_path and start_path in visible_paths:
+            start_index = visible_paths.index(start_path)
+        elif start_path and start_path in self._songs and start_path not in self._ghost_paths:
+            # Not under the active filter — edit just this one song.
+            songs = [self._songs[start_path]]
+        else:
+            for p in self._selected_paths():
+                if p in visible_paths:
+                    start_index = visible_paths.index(p)
+                    break
 
+        self._sequencer_renamed = False
+        self._sequencer_last_path = songs[start_index].get('path', '') if songs else ''
         dlg = SongSequencerDialog(
             songs=songs,
             filter_label=self._filter_display_name(),
@@ -2069,26 +2549,51 @@ class MainWindow(QMainWindow):
             player_bar=self._player_bar,
             theme=self._theme,
             start_index=start_index,
+            json_title_provider=self._json_title_for_path,
+            initial_filename=initial_filename,
+            lyrics_store=self._lyrics_store,
             parent=self,
         )
         dlg.rename_requested.connect(self._sequencer_on_rename)
         dlg.metadata_requested.connect(self._sequencer_on_metadata)
         dlg.tags_requested.connect(self._sequencer_on_tags)
+        dlg.trim_requested.connect(self._on_trim_song)
         # Persist every per-song commit (Save / Save & Next / Previous /
         # Close all funnel through _commit_current) so tag changes are on
         # disk before the user moves on.
         dlg.committed.connect(self._sequencer_on_committed)
         dlg.exec_()
         # Stats refresh once after the dialog closes — saves already
-        # happened mid-session via _sequencer_on_committed.
+        # happened mid-session via _sequencer_on_committed. A rename changes
+        # what the JSON matches, so re-run the (background) reconcile once.
+        if self._sequencer_renamed:
+            self._request_playlist_reconcile()
         self._update_stats()
 
-    def _sequencer_on_committed(self):
+    def _sequencer_on_committed(self, summary: str = ''):
         # Per-song edits already updated `_path_to_record` / `_songs` /
-        # `_lyrics_store` in-memory. Save the JSON to disk but skip the
-        # full reconcile — no need to re-scan the whole library just to
-        # pick up changes we already applied.
+        # `_lyrics_store` in-memory. Save the JSON to disk right away, refresh
+        # the row and counters so the list never lags behind the editor, and
+        # re-run the (background) matcher shortly so the sync/issue badges
+        # follow — all while the editor stays open.
         self._save_playlist_store(reconcile=False)
+        path = getattr(self, '_sequencer_last_path', '')
+        if path in self._songs:
+            self._refresh_song_row(path)
+        self._schedule_reconcile()
+        if summary:
+            self._status_lbl.setText(summary)
+            self._show_toast(summary)
+
+    def _schedule_reconcile(self, delay_ms: int = 500):
+        """Coalesce several quick edits into one background reconcile."""
+        timer = getattr(self, '_reconcile_debounce', None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(self._request_playlist_reconcile)
+            self._reconcile_debounce = timer
+        timer.start(delay_ms)
 
     def _sequencer_on_rename(self, old_path: str, new_filename: str):
         if old_path not in self._songs:
@@ -2107,12 +2612,19 @@ class MainWindow(QMainWindow):
         if result is None:
             return
         _, new_path = result
+        self._sequencer_renamed = True
+        self._sequencer_last_path = new_path
         self._lyrics_store.rename_for_song(old_path, new_path)
         self._migrate_song_path_in_ui(old_path, new_path, new_filename)
+        self._refresh_song_row(new_path)
+        self._status_lbl.setText(
+            f'Renamed to "{new_filename}" — JSON title and lyrics file updated.'
+        )
 
     def _sequencer_on_metadata(self, path: str, title: str, artist: str, album: str):
         if path not in self._songs:
             return
+        self._sequencer_last_path = path
         if not write_metadata(
             path,
             title=title or None,
@@ -2137,9 +2649,77 @@ class MainWindow(QMainWindow):
         if album_item:  album_item.setText(album)
         self._refresh_grid_text(path)
 
+    def _on_trim_song(self, path: str = ''):
+        """Open the Trimmer for ``path`` (or the single selected song)."""
+        if not path or path not in self._songs:
+            selected = [p for p in self._selected_paths() if p in self._songs and p not in self._ghost_paths]
+            if len(selected) != 1:
+                QMessageBox.information(self, 'Trim', 'Select exactly one song to trim.')
+                return
+            path = selected[0]
+        if path in self._ghost_paths:
+            return
+        song = self._songs[path]
+        if 'cover_data' not in song and song.get('has_cover'):
+            try:
+                data, _mime = read_cover(path)
+                if data:
+                    song['cover_data'] = data
+            except Exception:
+                pass
+        dlg = TrimmerDialog(
+            song=song, theme=self._theme, player_bar=self._player_bar,
+            lyrics_store=self._lyrics_store, parent=self,
+        )
+        dlg.trimmed.connect(self._on_song_trimmed)
+        dlg.exec_()
+
+    def _on_song_trimmed(self, result):
+        """The file was overwritten in place: refresh the song's live data
+        (same dict, same JSON record — nothing is cloned)."""
+        path = result.path
+        song = self._songs.get(path)
+        if song is None:
+            return
+        if self._player_bar.current_path() == path:
+            self._player_bar.stop()
+        song['duration_ms'] = result.new_duration_ms
+        cover_item = self._path_to_cover_item.get(path)
+        if cover_item is not None:
+            row = cover_item.row()
+            size_item = self._table.item(row, COL_SIZE)
+            if size_item is not None:
+                try:
+                    size_bytes = os.path.getsize(path)
+                except OSError:
+                    size_bytes = 0
+                size_item.setText(_fmt_size(size_bytes))
+                size_item.setData(Qt.UserRole, size_bytes)
+        try:
+            data, _mime = read_cover(path)
+        except Exception:
+            data = None
+        song['has_cover'] = bool(data)
+        if data:
+            song['cover_data'] = data
+        self._update_row_cover(path, data, bool(data))
+        self._update_stats()
+        name = song.get('filename') or os.path.basename(path)
+        msg = (f'Trimmed "{name}" — removed {format_ms(result.removed_ms)}, '
+               f'new length {format_ms(result.new_duration_ms)}.')
+        if result.backup_path:
+            msg += f' Backup: {os.path.basename(result.backup_path)}'
+        self._status_lbl.setText(msg)
+        self._show_toast(msg)
+
     def _sequencer_on_tags(self, path: str, add_tags: set, remove_tags: set):
         if path not in self._songs:
             return
+        self._sequencer_last_path = path
+        if not self._playlist_store.has_record(path):
+            # A song without a JSON entry: create (or adopt) one so the tags
+            # have somewhere to live — never silently ignored.
+            self._playlist_store.create_records_for_paths([path], self._songs)
         self._playlist_store.set_tags_for_paths(
             [path], self._songs, add_tags, remove_tags
         )
@@ -2157,6 +2737,7 @@ class MainWindow(QMainWindow):
 
         self._songs.clear()
         self._ghost_paths.clear()
+        self._last_missing_record_indexes = None
         self._path_to_grid_item.clear()
         self._path_to_grid_card.clear()
         self._path_to_cover_item.clear()
@@ -2180,8 +2761,7 @@ class MainWindow(QMainWindow):
         self._update_stats()
         self._set_buttons_enabled(False)
 
-        display = folder if len(folder) <= 55 else '…' + folder[-52:]
-        self._folder_lbl.setText(display)
+        self._folder_lbl.set_full_text(folder)
         self._folder_lbl.setToolTip(folder)
         self._can_rescan = False
 
@@ -2224,14 +2804,19 @@ class MainWindow(QMainWindow):
         self._sb_pbar.hide()
         self._stop_scan_pulse()
 
+        # Lyrics must be indexed before the reconcile worker starts: its
+        # health audit reads the lyrics store from another thread.
+        self._lyrics_store.scan(self._songs)
         self._dbg(f"[2/5] reconciling tag JSON ({total} songs)…")
         self._request_playlist_reconcile()
         t0 = self._dbg_step("[2/5] tag JSON reconcile queued", t0)
 
-        self._lyrics_store.scan(self._songs)
         self._dbg("[3/5] updating stat counters…")
         self._update_stats()
         t0 = self._dbg_step("[3/5] stat counters updated", t0)
+        # Automatic lyrics download resumes for whatever this library is
+        # missing (previous run's worker was cancelled by _start_scan).
+        QTimer.singleShot(0, self._maybe_auto_fetch_lyrics)
 
         self._set_buttons_enabled(total > 0)
         self._can_rescan = True
@@ -2317,11 +2902,11 @@ class MainWindow(QMainWindow):
     # =========================================================================
 
     def _add_table_row(self, song: dict):
-        if not self._is_scanning:
+        if not self._is_scanning and not self._bulk_row_update:
             self._table.setSortingEnabled(False)
         row = self._table.rowCount()
         self._table.insertRow(row)
-        self._table.setRowHeight(row, ROW_HEIGHT)
+        self._table.setRowHeight(row, self._row_height)
 
         # Col 0 – cover thumbnail
         cover_item = QTableWidgetItem()
@@ -2341,11 +2926,15 @@ class MainWindow(QMainWindow):
             val = song.get(key, '')
             item = QTableWidgetItem(val)
             item.setData(Qt.UserRole, song['path'])
-            if col == COL_TITLE:
-                item.setFont(QFont('Segoe UI', 10, QFont.Medium))
             if col == COL_FILENAME:
-                color = '#ef4444' if song.get('is_ghost') else self._theme['text_dim']
-                item.setForeground(QColor(color))
+                f = item.font()
+                f.setWeight(QFont.Medium)
+                item.setFont(f)
+                if song.get('is_ghost'):
+                    item.setForeground(QColor(self._theme['red']))
+                    item.setToolTip('JSON entry without a music file')
+            elif col in (COL_TITLE, COL_ARTIST, COL_ALBUM, COL_FMT):
+                item.setForeground(QColor(self._theme['text_secondary']))
             self._table.setItem(row, col, item)
             if col == COL_TITLE:
                 self._path_to_title_item[song['path']] = item
@@ -2384,7 +2973,7 @@ class MainWindow(QMainWindow):
         size_item.setFlags(size_item.flags() & ~Qt.ItemIsEditable)
         self._table.setItem(row, COL_SIZE, size_item)
 
-        if not self._is_scanning:
+        if not self._is_scanning and not self._bulk_row_update:
             self._table.setSortingEnabled(True)
 
     def _add_grid_item(self, song: dict):
@@ -2405,6 +2994,9 @@ class MainWindow(QMainWindow):
         card.set_tags(html, tooltip)
         self._grid.setItemWidget(item, card)
         self._path_to_grid_card[song['path']] = card
+        # A thumbnail delivered while only the list existed never reached this
+        # (new) card — let the visible-grid loader queue it again.
+        self._thumbs_queued.discard(song['path'])
 
     def _update_row_cover(self, path: str, img_data: bytes | None, has: bool, cache_data: bool = True):
         """Refresh cover icon in both table and grid."""
@@ -2449,9 +3041,22 @@ class MainWindow(QMainWindow):
         if not label:
             return
         has = self._lyrics_store.has_lyrics(path)
-        color = self._theme.get('cyan', '#0891b2') if has else self._theme.get('text_dim', '#94a3b8')
-        label.setPixmap(get_icon('text', 16, color).pixmap(16, 16))
-        label.setToolTip('Has lyrics' if has else 'No lyrics')
+        song = self._songs.get(path, {})
+        info = None if has else self._lyrics_store.miss_info(self._lyrics_store.miss_key_for_song(song))
+        if has:
+            color, icon, tip = self._theme.get('cyan', '#0891b2'), 'text', 'Has lyrics'
+        elif info:
+            when = datetime.fromtimestamp(float(info.get('ts', 0))).strftime('%Y-%m-%d')
+            sources = ', '.join(_LYRICS_SOURCE_LABELS.get(x, x) for x in info.get('sources', []))
+            color, icon = self._theme.get('orange', '#ff9500'), 'warning'
+            tip = (f'Not found online — tried {sources or "LRCLIB"} on {when} '
+                   f'(searched "{info.get("artist", "")}" – "{info.get("title", "")}").\n'
+                   'Remembered across sessions. Select the song and press Fetch to try again, '
+                   'or Import an .lrc file.')
+        else:
+            color, icon, tip = self._theme.get('text_dim', '#94a3b8'), 'text', 'No lyrics yet'
+        label.setPixmap(get_icon(icon, 16, color).pixmap(16, 16))
+        label.setToolTip(tip)
 
     def _refresh_song_row(self, path: str):
         """Refresh all visible cells for a single song row + update counters."""
@@ -2466,8 +3071,14 @@ class MainWindow(QMainWindow):
             item = item_dict.get(path)
             if item:
                 item.setText(song.get(key, ''))
+        cover_item = self._path_to_cover_item.get(path)
+        if cover_item is not None:
+            fn_item = self._table.item(cover_item.row(), COL_FILENAME)
+            if fn_item is not None and fn_item.text() != song.get('filename', ''):
+                fn_item.setText(song.get('filename', ''))
         self._refresh_song_lyrics_cell(path)
         self._refresh_song_tag_preview(path)
+        self._refresh_song_issue_indicator(path)
         self._refresh_grid_text(path)
         self._update_stats()
 
@@ -2482,7 +3093,7 @@ class MainWindow(QMainWindow):
             label = display_for(tag)
             icon_path = self._tag_icons.get(tag, '')
             if icon_path and os.path.exists(icon_path):
-                uri = Path(icon_path).resolve().as_uri()
+                uri = file_uri(icon_path)
                 parts.append(
                     f'<img src="{uri}" width="{icon_size}" height="{icon_size}" title="{label}"/>'
                 )
@@ -2522,7 +3133,11 @@ class MainWindow(QMainWindow):
         x = 0
         for tag in shown:
             icon_path = resolve_tag_icon(tag) or self._tag_icons.get(tag, '')
-            icon = icon_from_file(icon_path, icon_size) if icon_path and os.path.exists(icon_path) else QIcon()
+            # icon_from_file already degrades to an empty QIcon if the file
+            # is missing (handled below via icon_pm.isNull() either way), so
+            # skip the redundant os.path.exists() stat on this hot path —
+            # called for every tag on every song, every reconcile.
+            icon = icon_from_file(icon_path, icon_size) if icon_path else QIcon()
             icon_pm = icon.pixmap(icon_size, icon_size) if not icon.isNull() else QPixmap()
             if icon_pm.isNull():
                 painter.setPen(QPen(QColor(self._theme['text_dim'])))
@@ -2567,11 +3182,21 @@ class MainWindow(QMainWindow):
         label.setToolTip(tooltip)
         return label
 
+    def _tag_tooltip(self, path: str) -> str:
+        """Plain-text tag list for a tooltip — the cheap half of what
+        ``_build_tag_preview`` returns, without the HTML/icon-lookup work
+        needed to also render the tag chips (which callers that only want
+        the tooltip, like the list view's pixmap label below, don't need)."""
+        tags = self._playlist_store.get_tags(path)
+        if not tags:
+            return 'No tags assigned'
+        return ', '.join(display_for(t) for t in tags)
+
     def _refresh_song_tag_preview(self, path: str):
         label = self._path_to_tag_label.get(path)
         if isinstance(label, QLabel):
             pixmap = self._build_tag_preview_pixmap(path, icon_size=16, max_icons=8)
-            _, tooltip = self._build_tag_preview(path, icon_size=16, max_icons=8)
+            tooltip = self._tag_tooltip(path)
             if pixmap:
                 label.setPixmap(pixmap)
                 label.setText('')
@@ -2589,7 +3214,16 @@ class MainWindow(QMainWindow):
         for path in targets:
             self._refresh_song_tag_preview(path)
 
-    def _rebuild_playlist_issue_map(self):
+    def _rebuild_playlist_issue_map(self, health_issues: list | None = None):
+        """Rebuild the per-path issue lookups used by the table's warning
+        icon, the sidebar's Sync Issues badge, and the New-songs tint.
+
+        ``health_issues`` should be the already-computed list from
+        ``PlaylistReconcileWorker`` (the audit's ``difflib`` fuzzy search
+        over every unmatched record is too slow to redo here on the UI
+        thread — see the worker's docstring). Only the empty-library
+        shortcut in ``_request_playlist_reconcile`` calls this without one,
+        where there is nothing to audit anyway."""
         issues_by_path: dict[str, list[dict]] = {}
 
         for entry in self._playlist_store.mismatch_records:
@@ -2617,10 +3251,73 @@ class MainWindow(QMainWindow):
                 issue['issue_type'] = 'invalid_tag'
                 issues_by_path.setdefault(matched_path, []).append(issue)
 
+        # Strict-sync audit. Only error/warning severities light up the
+        # per-row indicator; info items (no tags / no lyrics) live in the
+        # Sync Check dialog and the sidebar counters. Computed on the
+        # reconcile worker's background thread (see its docstring) — the
+        # only caller that gets here without one is the empty-library
+        # shortcut, where there is nothing to audit.
+        if health_issues is not None:
+            self._health_issues = health_issues
+        else:
+            self._health_issues = build_health_report(
+                self._playlist_store, self._songs, self._ghost_paths, self._lyrics_store,
+            )
+        health_by_path: dict[str, list] = {}
+        for issue in self._health_issues:
+            if issue.severity == 'info':
+                continue
+            key = issue.song_path
+            if issue.kind in ('missing_file', 'duplicate_entry') and not key:
+                key = f'__missing__:{issue.record_index}'
+            if issue.kind == 'duplicate_entry' and not issue.song_path:
+                key = f'__missing__:{issue.record_index}'
+            if not key:
+                continue
+            health_by_path.setdefault(key, []).append(issue)
+            # Skip kinds the legacy mismatch/invalid_tag entries already cover.
+            if issue.kind in ('invalid_tag',):
+                continue
+            if issue.kind == 'missing_file' and not issue.fixable:
+                continue
+            issues_by_path.setdefault(key, []).append({
+                'issue_type': 'health',
+                'kind': issue.kind,
+                'severity': issue.severity,
+                'message': issue.message,
+                'title': issue.json_title,
+                'filename': issue.disk_filename,
+                'suggestion': issue.suggestion,
+                'record_index': issue.record_index,
+                'tags': list(issue.tags),
+                'song': issue.json_title or issue.disk_filename,
+                'fixable': issue.fixable,
+                'extra': dict(issue.extra),
+            })
+        self._health_by_path = health_by_path
+
         self._playlist_issues_by_path = issues_by_path
 
     def _sync_ghost_rows(self):
-        """Remove stale ghost rows and rebuild them from missing_song_records."""
+        """Remove stale ghost rows and rebuild them from missing_song_records.
+
+        Skips the whole remove+recreate pass when the missing set is
+        unchanged from last time (the common case: most reconciles — e.g.
+        the debounced re-check after an Edit Song save — don't change which
+        JSON records are missing a file). Each ghost row costs a real
+        QTableWidget.insertRow() against the whole table, which measured
+        multiple seconds for a few hundred ghosts on a ~3000-song library
+        regardless of batching sort/repaints around it, so redoing that for
+        an identical set on every edit was pure waste."""
+        missing = self._playlist_store.missing_song_records
+        current_indexes = frozenset(
+            idx for entry in missing
+            if 0 <= (idx := entry.get('record_index', -1)) < len(self._playlist_store.records)
+        )
+        if current_indexes == self._last_missing_record_indexes:
+            return
+        self._last_missing_record_indexes = current_indexes
+
         if self._ghost_paths:
             self._table.setUpdatesEnabled(False)
             try:
@@ -2647,27 +3344,43 @@ class MainWindow(QMainWindow):
                 self._path_to_issue_button.pop(path, None)
             self._ghost_paths.clear()
 
-        for entry in self._playlist_store.missing_song_records:
-            record_index = entry.get('record_index', -1)
-            if not (0 <= record_index < len(self._playlist_store.records)):
-                continue
-            record = self._playlist_store.records[record_index]
-            ghost_path = f'__missing__:{record_index}'
-            ghost_song = {
-                'path': ghost_path,
-                'filename': entry.get('title', ''),
-                'title': '',
-                'artist': '',
-                'album': '',
-                'has_cover': False,
-                'format': '',
-                'is_ghost': True,
-            }
-            self._songs[ghost_path] = ghost_song
-            self._ghost_paths.add(ghost_path)
-            self._playlist_store._path_to_record[ghost_path] = record
-            self._add_table_row(ghost_song)
-            self._add_grid_item(ghost_song)
+        if not missing:
+            return
+
+        # Batch the whole rebuild: _add_table_row toggles setSortingEnabled
+        # per call by default, and re-enabling it on a non-empty table forces
+        # a full re-sort — fine for one row, an O(N × table size) sort storm
+        # for N ghost rows (measured multiple seconds on a ~3000-song
+        # library). Suspend that (and repaints) for the whole batch instead.
+        self._table.setUpdatesEnabled(False)
+        self._table.setSortingEnabled(False)
+        self._bulk_row_update = True
+        try:
+            for entry in missing:
+                record_index = entry.get('record_index', -1)
+                if not (0 <= record_index < len(self._playlist_store.records)):
+                    continue
+                record = self._playlist_store.records[record_index]
+                ghost_path = f'__missing__:{record_index}'
+                ghost_song = {
+                    'path': ghost_path,
+                    'filename': entry.get('title', ''),
+                    'title': '',
+                    'artist': '',
+                    'album': '',
+                    'has_cover': False,
+                    'format': '',
+                    'is_ghost': True,
+                }
+                self._songs[ghost_path] = ghost_song
+                self._ghost_paths.add(ghost_path)
+                self._playlist_store._path_to_record[ghost_path] = record
+                self._add_table_row(ghost_song)
+                self._add_grid_item(ghost_song)
+        finally:
+            self._bulk_row_update = False
+            self._table.setSortingEnabled(True)
+            self._table.setUpdatesEnabled(True)
 
     def _make_issue_button(self, path: str) -> QToolButton:
         btn = QToolButton()
@@ -2819,22 +3532,17 @@ class MainWindow(QMainWindow):
     def _on_set_view(self, mode: str):
         ic = self._icon_color()
         if mode == 'grid':
-            self._stack.setCurrentIndex(1)
-            self._btn_view_grid.setObjectName('btnViewActive')
-            self._btn_view_list.setObjectName('btnViewInactive')
-            self._btn_view_grid.setIcon(get_icon('grid', 24, '#ffffff'))
-            self._btn_view_list.setIcon(get_icon('list', 24, ic))
+            fade_to(self._stack, 1)
+            self._btn_view_grid.setChecked(True)
+            self._btn_view_grid.setIcon(get_icon('grid', 14, '#ffffff'))
+            self._btn_view_list.setIcon(get_icon('list', 14, ic))
             if self._grid_build_queue and not self._grid_chunk_timer:
                 self._start_grid_build()
         else:
-            self._stack.setCurrentIndex(0)
-            self._btn_view_list.setObjectName('btnViewActive')
-            self._btn_view_grid.setObjectName('btnViewInactive')
-            self._btn_view_list.setIcon(get_icon('list', 24, '#ffffff'))
-            self._btn_view_grid.setIcon(get_icon('grid', 24, ic))
-        for btn in (self._btn_view_list, self._btn_view_grid):
-            btn.style().unpolish(btn)
-            btn.style().polish(btn)
+            fade_to(self._stack, 0)
+            self._btn_view_list.setChecked(True)
+            self._btn_view_list.setIcon(get_icon('list', 14, '#ffffff'))
+            self._btn_view_grid.setIcon(get_icon('grid', 14, ic))
         self._schedule_thumb_refresh()
 
     # =========================================================================
@@ -2921,7 +3629,7 @@ class MainWindow(QMainWindow):
         selected = self._selected_paths()
         count = len(selected)
         if count == 0:
-            self._hint_lbl.setText('← Select a song in the list below')
+            self._hint_lbl.setText('No selection — actions apply to all songs')
         elif count == 1:
             song = self._songs.get(selected[0], {})
             name = song.get('title') or song.get('filename', '')
@@ -3058,7 +3766,7 @@ class MainWindow(QMainWindow):
                 self._update_row_cover(path, None, False)
                 done += 1
         self._update_stats()
-        self._status_lbl.setText(f'Deleted cover art from {done} song(s).')
+        self._notify(f'Deleted cover art from {done} song(s).')
 
     def _on_assign_playlists(self):
         if self._playlist_reconcile_pending:
@@ -3121,36 +3829,37 @@ class MainWindow(QMainWindow):
             if remove_tags:
                 action_parts.append(f'removed {len(remove_tags)}')
             action_text = ', '.join(action_parts) if action_parts else 'updated'
-            self._status_lbl.setText(
-                f'Tag assignments saved for {changed} song(s) ({action_text}).'
-            )
+            self._notify(f'Tag assignments saved for {changed} song(s) ({action_text}).')
+            for p in selected:
+                self._refresh_song_row(p)
 
     def _apply_rename_intents(
         self,
         selected: list[str],
         intents: dict[str, str],
-    ) -> tuple[list[str], int]:
-        """Rename files on disk and update in-memory song state.
+    ) -> tuple[list[str], int, list[tuple[str, str]]]:
+        """Rename files on disk and update in-memory song state for a batch
+        of (old_path -> new_filename) intents (see SpacingFixDialog).
 
-        Returns the (possibly translated) selection list and the number of
-        successful renames.
+        Returns (translated selection, successful-rename count, failures).
+        ``failures`` is ``[(old_filename, reason), ...]`` — collected rather
+        than shown as one QMessageBox per file, since this runs over a
+        whole batch; the caller presents them together.
         """
         translated = list(selected)
         renamed = 0
+        failures: list[tuple[str, str]] = []
         for old_path, new_filename in intents.items():
             if old_path not in self._songs:
                 continue
+            old_name = Path(old_path).name
             try:
                 result = self._playlist_store.rename_song_file(old_path, new_filename)
             except FileExistsError as exc:
-                QMessageBox.warning(self, 'Rename Failed', str(exc))
+                failures.append((old_name, str(exc)))
                 continue
             except (ValueError, OSError) as exc:
-                QMessageBox.warning(
-                    self,
-                    'Rename Failed',
-                    f'Could not rename "{Path(old_path).name}":\n{exc}',
-                )
+                failures.append((old_name, str(exc)))
                 continue
             if result is None:
                 continue
@@ -3159,11 +3868,15 @@ class MainWindow(QMainWindow):
             self._migrate_song_path_in_ui(old_path, new_path, new_filename)
             translated = [new_path if p == old_path else p for p in translated]
             renamed += 1
-        return translated, renamed
+        return translated, renamed, failures
 
     def _migrate_song_path_in_ui(self, old_path: str, new_path: str, new_filename: str):
         """Move all per-path UI state from old_path to new_path."""
+        # The store shares our `_songs` dict and has usually re-keyed the
+        # entry already (rename_song_file); accept either state.
         song = self._songs.pop(old_path, None)
+        if song is None:
+            song = self._songs.get(new_path)
         if song is None:
             return
         song['path'] = new_path
@@ -3175,6 +3888,7 @@ class MainWindow(QMainWindow):
             self._path_to_title_item,
             self._path_to_artist_item,
             self._path_to_album_item,
+            self._path_to_lyrics_label,
             self._path_to_tag_label,
             self._path_to_issue_button,
             self._path_to_grid_item,
@@ -3182,6 +3896,17 @@ class MainWindow(QMainWindow):
         ):
             if old_path in mapping:
                 mapping[new_path] = mapping.pop(old_path)
+
+        # The issue button's click handler captured the old path.
+        issue_btn = self._path_to_issue_button.get(new_path)
+        if issue_btn is not None:
+            try:
+                issue_btn.clicked.disconnect()
+            except TypeError:
+                pass
+            issue_btn.clicked.connect(
+                lambda _=False, song_path=new_path: self._on_song_issue_clicked(song_path)
+            )
 
         cover_item = self._path_to_cover_item.get(new_path)
         if cover_item:
@@ -3207,6 +3932,9 @@ class MainWindow(QMainWindow):
             self._thumbs_queued.discard(old_path)
         if old_path in self._playlist_issues_by_path:
             self._playlist_issues_by_path[new_path] = self._playlist_issues_by_path.pop(old_path)
+        if old_path in self._health_by_path:
+            self._health_by_path[new_path] = self._health_by_path.pop(old_path)
+        self._refresh_grid_text(new_path)
 
     # ── Fix Metadata ──────────────────────────────────────────────────────────
 
@@ -3306,7 +4034,7 @@ class MainWindow(QMainWindow):
         if playlist_dirty:
             self._save_playlist_store()
         self._update_stats()
-        self._status_lbl.setText(f'Metadata updated for {done} song(s).')
+        self._notify(f'Metadata updated for {done} song(s).')
 
     # =========================================================================
     # Helpers
@@ -3333,6 +4061,15 @@ class MainWindow(QMainWindow):
             self._apply_issue_update_from_song(path, song, issue)
         elif action == PlaylistSongIssueDialog.ACTION_REMOVE_INVALID_TAGS:
             self._apply_issue_remove_invalid_tags(issue)
+        elif action == PlaylistSongIssueDialog.ACTION_MERGE_DUPLICATES:
+            extra = issue.get('extra', {}) or {}
+            keep = int(extra.get('keep_index', issue.get('record_index', -1)))
+            drops = [int(i) for i in extra.get('drop_indexes', [])]
+            if keep < 0 or not drops:
+                QMessageBox.information(self, 'JSON Warning', 'Nothing to merge.')
+                return
+            if self._playlist_store.merge_records(keep, drops) and self._save_playlist_store():
+                self._notify('Merged duplicate JSON entries into one.')
 
     def _apply_issue_update_from_song(self, path: str, song: dict, issue: dict):
         record_index = int(issue.get('record_index', -1))
@@ -3343,7 +4080,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, 'JSON Warning', 'The JSON record already matches this file.')
             return
         if self._save_playlist_store():
-            self._status_lbl.setText(f'Updated JSON record for {song.get("filename") or path}.')
+            self._notify(f'Updated JSON record for {song.get("filename") or path}.')
 
     def _apply_issue_remove_invalid_tags(self, issue: dict):
         record_index = int(issue.get('record_index', -1))
@@ -3354,7 +4091,20 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, 'JSON Warning', 'No invalid tags were removed.')
             return
         if self._save_playlist_store():
-            self._status_lbl.setText('Removed invalid JSON tag names.')
+            self._notify('Removed invalid JSON tag names.')
+
+    def _show_toast(self, message: str, duration_ms: int = 3200):
+        """Non-blocking animated confirmation over the content area."""
+        toast = getattr(self, '_toast', None)
+        if toast is not None:
+            toast.show_message(message, duration_ms)
+        else:
+            self._status_lbl.setText(message)
+
+    def _notify(self, message: str):
+        """Status bar + toast: every successful edit confirms visibly."""
+        self._status_lbl.setText(message)
+        self._show_toast('✓  ' + message)
 
     def _set_song_filter(self, filter_name: str):
         if filter_name == self._active_song_filter and filter_name != 'all':
@@ -3491,7 +4241,7 @@ class MainWindow(QMainWindow):
             for p in self._songs:
                 self._refresh_song_lyrics_cell(p)
             self._update_stats()
-            self._status_lbl.setText(f'Deleted {removed} orphan lyrics file(s).')
+            self._notify(f'Deleted {removed} orphan lyrics file(s).')
             dlg.accept()
 
         btn_delete.clicked.connect(_do_delete)
@@ -3517,6 +4267,46 @@ class MainWindow(QMainWindow):
             or q in song.get('album', '').lower()
         )
 
+    def _is_new_song(self, path: str, song: dict) -> bool:
+        """A file the app has apparently never touched: no JSON entry AND no
+        embedded cover AND no title/artist metadata. All three together are
+        what mark it "new" rather than a JSON *sync* problem — a song that
+        already has a cover or metadata (i.e. was clearly processed before)
+        but lost its JSON entry shows up under JSON → Missing Entries / Sync
+        Issues instead, so the two sections never overlap."""
+        if path in self._ghost_paths:
+            return False
+        if self._playlist_store.has_record(path):
+            return False
+        return not song.get('has_cover') and not (song.get('title') and song.get('artist'))
+
+    def _refresh_new_markers(self) -> int:
+        """Tint the filename cell green for every song that is currently
+        "new" (see ``_is_new_song``) and reset any that no longer qualify
+        (e.g. just got a cover or metadata). Called from ``_update_stats``,
+        which already runs after every action that could change the answer.
+        Returns the count, for the sidebar badge."""
+        new_color = QColor(self._theme.get('green', '#34c759'))
+        default_color = QColor(self._theme.get('text', '#1d1d1f'))
+        count = 0
+        for path, song in self._songs.items():
+            if path in self._ghost_paths:
+                continue
+            is_new = self._is_new_song(path, song)
+            if is_new:
+                count += 1
+            cover_item = self._path_to_cover_item.get(path)
+            if cover_item is None:
+                continue
+            fn_item = self._table.item(cover_item.row(), COL_FILENAME)
+            if fn_item is None:
+                continue
+            fn_item.setForeground(new_color if is_new else default_color)
+            fn_item.setToolTip(
+                'New — not yet processed (no cover, no tags, no metadata)' if is_new else ''
+            )
+        return count
+
     def _song_matches_filter(self, path: str, song: dict) -> bool:
         is_ghost = path in self._ghost_paths
         mode = self._active_song_filter
@@ -3524,12 +4314,16 @@ class MainWindow(QMainWindow):
             if not is_ghost:
                 return False
             return self._song_matches_search(song)
+        if mode == 'health':
+            return path in self._health_by_path and self._song_matches_search(song)
         if is_ghost:
             return False
         if not self._song_matches_search(song):
             return False
         if mode == 'all':
             return True
+        if mode == 'new_song':
+            return self._is_new_song(path, song)
         if mode == 'no_cover':
             return not song.get('has_cover')
         if mode == 'no_meta':
@@ -3540,6 +4334,9 @@ class MainWindow(QMainWindow):
             return bool(self._playlist_issues_by_path.get(path))
         if mode == 'no_lyrics':
             return not self._lyrics_store.has_lyrics(path)
+        if mode == 'lyrics_not_found':
+            return (not self._lyrics_store.has_lyrics(path)
+                    and self._lyrics_store.is_known_miss(self._lyrics_store.miss_key_for_song(song)))
         if mode == 'typo_errors':
             return has_typo_error(song.get('filename') or song.get('title') or path)
         return True
@@ -3568,6 +4365,7 @@ class MainWindow(QMainWindow):
             self._schedule_thumb_refresh()
             self._update_remove_missing_btn()
             self._update_sidebar_visibility()
+            self._update_filter_count()
             return
 
         self._table.setUpdatesEnabled(False)
@@ -3593,17 +4391,44 @@ class MainWindow(QMainWindow):
         self._schedule_thumb_refresh()
         self._update_remove_missing_btn()
         self._update_sidebar_visibility()
+        self._update_filter_count()
 
     _FILTER_TO_GROUPS = {
         'all':          {'covers', 'meta', 'tags', 'lyrics'},
+        'new_song':     {'covers', 'meta', 'tags', 'lyrics'},
         'no_cover':     {'covers'},
         'no_meta':      {'meta'},
         'typo_errors':  {'meta'},
         'no_tags':      {'tags'},
+        'health':       {'tags', 'meta'},
         'mismatch':     {'tags'},
         'missing_file': {'tags'},
         'no_lyrics':    {'lyrics'},
+        'lyrics_not_found': {'lyrics', 'meta'},
     }
+
+    def _update_filter_count(self):
+        if not hasattr(self, '_filter_count_lbl'):
+            return
+        total = sum(1 for p in self._songs if p not in self._ghost_paths)
+        if self._active_song_filter == 'missing_file':
+            n = sum(1 for row in range(self._table.rowCount()) if not self._table.isRowHidden(row))
+            self._filter_count_lbl.setText(f'{n} JSON entr{"y" if n == 1 else "ies"} without a file')
+            return
+        if self._active_song_filter == 'all' and not self._search_query:
+            n = total
+        else:
+            n = 0
+            for row in range(self._table.rowCount()):
+                if self._table.isRowHidden(row):
+                    continue
+                item = self._table.item(row, COL_COVER)
+                if item and item.data(Qt.UserRole) not in self._ghost_paths:
+                    n += 1
+        text = f'{n} song{"" if n == 1 else "s"}'
+        if n != total:
+            text += f' of {total}'
+        self._filter_count_lbl.setText(text)
 
     def _update_sidebar_visibility(self):
         """Show only the action group(s) relevant to the active filter."""
@@ -3611,10 +4436,15 @@ class MainWindow(QMainWindow):
             self._active_song_filter,
             {'covers', 'meta', 'tags', 'lyrics'},
         )
+        before = (self._grp_covers.isVisible(), self._grp_meta.isVisible(),
+                  self._grp_tags.isVisible(), self._grp_lyrics.isVisible())
         self._grp_covers.setVisible('covers' in visible)
         self._grp_meta.setVisible('meta' in visible)
         self._grp_tags.setVisible('tags' in visible)
         self._grp_lyrics.setVisible('lyrics' in visible)
+        after = ('covers' in visible, 'meta' in visible, 'tags' in visible, 'lyrics' in visible)
+        if before != after and self._grp_covers.parentWidget() is not None:
+            fade_in(self._grp_covers.parentWidget(), 200, 0.4)
 
     def _update_remove_missing_btn(self):
         """Show 'Remove from JSON' only when Missing filter is active and ghost rows are selected."""
@@ -3663,10 +4493,12 @@ class MainWindow(QMainWindow):
         )
         mismatch_tags = len(self._playlist_store.invalid_tag_records)
         missing_file = len(self._ghost_paths)
+        health = sum(1 for i in self._health_issues if i.severity != 'info')
         no_lyrics = sum(
             1 for path in self._songs
             if path not in self._ghost_paths and not self._lyrics_store.has_lyrics(path)
         )
+        new_count = self._refresh_new_markers()
 
         def _set(filter_mode, value):
             row = self._stat_rows_by_filter.get(filter_mode)
@@ -3674,15 +4506,21 @@ class MainWindow(QMainWindow):
                 row.set_value(value)
 
         lyrics_orphan = len(self._lyrics_store.orphan_lrc_files)
+        lyrics_not_found = self._lyrics_store.not_found_count(
+            {p: s for p, s in self._songs.items() if p not in self._ghost_paths}
+        )
 
         _set('all',           total)
+        _set('new_song',      new_count)
         _set('no_cover',      missing)
         _set('no_meta',       no_metadata)
         _set('typo_errors',   typo_errors)
         _set('no_tags',       missing_tags)
+        _set('health',        health)
         _set('mismatch',      mismatch_tags)
         _set('missing_file',  missing_file)
         _set('no_lyrics',     no_lyrics)
+        _set('lyrics_not_found', lyrics_not_found)
         _set('lyrics_orphan', lyrics_orphan)
 
         self._btn_fix_invalid_tags.setEnabled(mismatch_tags > 0)
@@ -3716,10 +4554,9 @@ class MainWindow(QMainWindow):
             json_bits.append('all JSON entries matched')
 
         status = f'{scan_part} — JSON: ' + ', '.join(json_bits)
-        if invalid_count:
-            status += '  (click the Mismatch card for details)'
-        if missing_count:
-            status += '  (click the Missing card to review)'
+        health = sum(1 for i in self._health_issues if i.severity != 'info')
+        if health:
+            status += f'  ·  {health} sync issue(s) — open Sync Check'
         return status
 
     def _on_clear_meta(self):
@@ -3773,12 +4610,12 @@ class MainWindow(QMainWindow):
         if playlist_dirty:
             self._save_playlist_store()
         self._update_stats()
-        self._status_lbl.setText(f'Cleared tags from {done} song(s).')
+        self._notify(f'Cleared tags from {done} song(s).')
 
     def _set_buttons_enabled(self, enabled: bool):
         for btn in (
             self._btn_auto, self._btn_specific, self._btn_delete,
-            self._btn_fix_auto, self._btn_fix_manual, self._btn_clear_meta,
+            self._btn_fix_auto, self._btn_fix_manual, self._btn_trim, self._btn_clear_meta,
         ):
             btn.setEnabled(enabled)
         self._update_playlist_action_state(base_enabled=enabled)
@@ -3795,6 +4632,13 @@ class MainWindow(QMainWindow):
             if w and w.isRunning():
                 w.cancel()
                 w.wait(300)
+        # The lyrics download is restarted for the new library once the scan
+        # completes (auto mode), so it is safe to stop it here.
+        if self._lyrics_fetch_worker and self._lyrics_fetch_worker.isRunning():
+            self._lyrics_fetch_worker.cancel()
+            self._lyrics_fetch_worker.wait(1500)
+            self._lyrics_fetch_worker = None
+            self._sb_pbar.hide()
 
     def _fit_button_text(self, btn: QPushButton, min_px: int = 9, max_px: int = 22):
         text = btn.text().strip()
@@ -3813,23 +4657,38 @@ class MainWindow(QMainWindow):
         btn.setFont(f)
 
     def _update_action_button_layout(self, width: int):
-        fs = max(10, min(22, int(10 + (width - 960) * 12 / 640)))
-        icon_sz = max(16, min(28, int(16 + (width - 960) * 12 / 640)))
-        for btn in (
-            self._btn_auto, self._btn_specific, self._btn_delete,
-            self._btn_fix_auto, self._btn_fix_manual, self._btn_clear_meta,
-            self._btn_playlist_assign, self._btn_playlist_report,
-        ):
-            btn.setIconSize(QSize(icon_sz, icon_sz))
-            f = btn.font()
-            f.setPixelSize(fs)
-            btn.setFont(f)
-        for btn in (
-            self._btn_auto, self._btn_specific, self._btn_delete,
-            self._btn_fix_auto, self._btn_fix_manual, self._btn_clear_meta,
-            self._btn_playlist_assign, self._btn_playlist_report,
-        ):
-            self._fit_button_text(btn)
+        """Per group: keep labels while every button fits at the comfort
+        size, otherwise switch the whole group to icon-only buttons (labels
+        stay as tooltips). AutoFitButton fine-tunes the font in between."""
+        sc = self._ui_scale
+        font = QFont(self.font())
+        font.setPixelSize(max(1, int(round(10 * sc))))     # the fitter's minimum
+        fm = QFontMetrics(font)
+        reserve = int(round(30 * sc))
+        for group, buttons in getattr(self, '_action_groups', ()):
+            if not group.isVisible():
+                continue
+            visible = [b for b in buttons if not b.isHidden()]
+            if not visible:
+                continue
+            avail = group.width() - 2
+            gaps = 6 * (len(visible) - 1)
+            # Buttons share the row equally (Ignored size policy), so the
+            # longest label decides for the whole group.
+            share = (avail - gaps) / len(visible)
+            widest = max(fm.horizontalAdvance(b.base_text()) for b in visible)
+            icon_w = max(b.iconSize().width() for b in visible)
+            if avail <= 0 or widest + icon_w + reserve <= share:
+                mode = 'full'
+            elif widest + reserve <= share:
+                mode = 'text'
+            else:
+                mode = 'icon'
+            for b in visible:
+                b.set_icon_only(mode == 'icon')
+                b.set_icon_hidden(mode == 'text')
+                if mode != 'icon':
+                    b._fit_timer.start(0)
 
     def _schedule_action_button_layout(self):
         if self._action_layout_update_pending:
@@ -3843,8 +4702,99 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, _apply)
 
     def resizeEvent(self, event):
-        """Scale action-bar button font continuously with window width."""
+        """Keep action-bar labels readable and the toast centred."""
         super().resizeEvent(event)
+        self._schedule_action_button_layout()
+        if hasattr(self, '_toast') and self._toast.isVisible():
+            self._toast.reposition()
+
+    # =========================================================================
+    # UI scale — sidebar, buttons and type grow with the screen
+    # =========================================================================
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._ui_scale_applied:
+            QTimer.singleShot(0, self._apply_ui_scale)
+        handle = self.windowHandle()
+        if handle is not None and not getattr(self, '_screen_hooked', False):
+            self._screen_hooked = True
+            handle.screenChanged.connect(lambda _s: QTimer.singleShot(0, self._apply_ui_scale))
+
+    def _screen_scale(self) -> float:
+        """1.0 on a 1440×900 work area, growing with the screen (max 1.75)."""
+        screen = None
+        handle = self.windowHandle()
+        if handle is not None:
+            screen = handle.screen()
+        if screen is None:
+            screen = QApplication.primaryScreen()
+        if screen is None:
+            return 1.0
+        geo = screen.availableGeometry()
+        factor = min(geo.width() / UI_SCALE_BASE[0], geo.height() / UI_SCALE_BASE[1])
+        factor = max(1.0, min(UI_SCALE_MAX, factor))
+        return round(factor * 20) / 20
+
+    def _apply_ui_scale(self, scale: float | None = None):
+        """Resize everything that has a fixed pixel size (the stylesheet
+        scales its own px values) so the app stays proportionate on big
+        and small screens."""
+        if scale is None:
+            scale = self._screen_scale()
+        if self._ui_scale_applied and abs(scale - self._ui_scale) < 0.01:
+            return
+        self._ui_scale = scale
+        self._ui_scale_applied = True
+        sc = lambda v: max(1, int(round(v * scale)))
+
+        QApplication.instance().setStyleSheet(build_stylesheet(self._theme, scale))
+
+        # sidebar
+        self._sidebar.setFixedWidth(sc(SIDEBAR_WIDTH))
+        for sec in self._stat_sections:
+            sec.set_scale(scale)
+        self._lyrics_progress.apply_theme(self._theme)
+        for b in (self._btn_settings, self._btn_theme):
+            b.setFixedSize(sc(34), sc(32))
+        self._update_theme_icon()
+
+        # toolbar
+        self._toolbar.setFixedHeight(sc(TOOLBAR_H))
+        self._search_bar.setFixedHeight(sc(32))
+        self._search_bar.setMinimumWidth(sc(220))
+        self._search_bar.setMaximumWidth(sc(420))
+        for b in (self._btn_view_list, self._btn_view_grid, self._btn_sequenze):
+            b.setFixedHeight(sc(30))
+
+        # action bar
+        self._action_icon_px = sc(ACTION_ICON_PX)
+        for btn in self._action_buttons:
+            btn.setMinimumHeight(sc(ACTION_BTN_H))
+            btn.setMaximumHeight(sc(ACTION_BTN_H))
+            btn.set_fit_range(sc(10), sc(12), sc(14), sc(30))
+        self._refresh_button_icons()
+
+        # song list
+        self._row_height = sc(ROW_HEIGHT)
+        self._table.verticalHeader().setDefaultSectionSize(self._row_height)
+        self._table.setColumnWidth(COL_COVER,  sc(THUMB_SIZE + 14))
+        self._table.setColumnWidth(COL_TITLE,  sc(150))
+        self._table.setColumnWidth(COL_ARTIST, sc(140))
+        self._table.setColumnWidth(COL_ALBUM,  sc(120))
+        self._table.setColumnWidth(COL_LYRICS, sc(44))
+        self._table.setColumnWidth(COL_TAGS,   sc(150))
+        self._table.setColumnWidth(COL_ISSUES, sc(58))
+        self._table.setColumnWidth(COL_FMT,    sc(64))
+        self._table.setColumnWidth(COL_SIZE,   sc(84))
+        self._table.setIconSize(QSize(sc(THUMB_SIZE), sc(THUMB_SIZE)))
+        self._table.setUpdatesEnabled(False)
+        try:
+            for row in range(self._table.rowCount()):
+                self._table.setRowHeight(row, self._row_height)
+        finally:
+            self._table.setUpdatesEnabled(True)
+        self._grid.setGridSize(QSize(sc(GRID_ITEM_W), sc(GRID_ITEM_H)))
         self._schedule_action_button_layout()
 
     def closeEvent(self, event):
@@ -3889,25 +4839,6 @@ def parse_filename(filename: str) -> tuple:
     return _clean(artist_raw.strip()), _clean(title_raw.strip()), album
 
 
-# ── Typo error detector ───────────────────────────────────────────────────────
-
-_AUDIO_EXTS_LOWER = {ext.lower() for ext in SUPPORTED_EXTENSIONS}
-
-
-def has_typo_error(name: str) -> bool:
-    """True when a filename / JSON title ends with a duplicated audio
-    extension (e.g. ``Foo.mp3.mp3`` or ``Bar.flac.mp3``). Catches the most
-    common rename / drag-and-drop fumble where the original extension was
-    left in place when a new one was appended."""
-    if not name:
-        return False
-    parts = name.lower().rsplit('.', 2)
-    if len(parts) < 3:
-        return False
-    return (f'.{parts[-2]}' in _AUDIO_EXTS_LOWER
-            and f'.{parts[-1]}' in _AUDIO_EXTS_LOWER)
-
-
 # ── Pixmap helpers ────────────────────────────────────────────────────────────
 
 def _make_placeholder(has_cover: bool, size: int, theme: dict | None = None) -> QPixmap:
@@ -3920,7 +4851,9 @@ def _make_placeholder(has_cover: bool, size: int, theme: dict | None = None) -> 
     px.fill(QColor(bg))
     painter = QPainter(px)
     painter.setPen(QColor('#ffffff'))
-    painter.setFont(QFont('Segoe UI', max(8, size // 3)))
+    f = QFont()
+    f.setPixelSize(max(8, size // 3))
+    painter.setFont(f)
     painter.drawText(px.rect(), Qt.AlignCenter, sym)
     painter.end()
     return px

@@ -9,12 +9,25 @@ same exact-match convention used for JSON record filename matching.
 
 from __future__ import annotations
 
+import json
 import os
+import re
 import shutil
+import threading
+import time
 from pathlib import Path
+
+from json_health import loose_key
 
 
 LRC_EXT = '.lrc'
+# "Not found online" list: songs no source had lyrics for. Re-asking every
+# run made the automatic fetch slow, so a miss is remembered across sessions
+# (for a year) together with the date and the sources that were tried. An
+# explicit Fetch on a selected song clears its entry and asks again.
+MISS_CACHE_NAME = '.lrc_misses.json'
+MISS_TTL_S = 365 * 24 * 3600
+_LRC_TS_RE = re.compile(r'\[(\d{1,3}):(\d{2})(?:[.:](\d{1,3}))?\]')
 
 
 class LyricsStore:
@@ -24,6 +37,9 @@ class LyricsStore:
         # Orphan .lrc files: present in the lyrics folder but no song in the
         # current library shares their filename stem. Populated by `scan`.
         self._orphan_lrc_files: list[str] = []
+        self._misses: dict[str, float] = {}
+        self._misses_loaded_for: str = ''
+        self._miss_lock = threading.Lock()
 
     # ── config ───────────────────────────────────────────────────────────────
 
@@ -158,8 +174,180 @@ class LyricsStore:
         self._paths_with_lyrics.add(new_song_path)
         return True
 
+    # ── negative cache (LRCLIB misses) ───────────────────────────────────────
+
+    @staticmethod
+    def miss_key(artist: str, title: str) -> str:
+        return loose_key(f'{artist or ""}|{title or ""}')
+
+    @staticmethod
+    def resolve_artist_title(song: dict) -> tuple[str, str, bool]:
+        """(artist, title, from_filename) for a song dict: metadata first,
+        then an ``Artist - Title`` split of the filename. Shared by the
+        fetch worker and the UI so both agree on the cache key."""
+        title = (song.get('title') or '').strip()
+        artist = (song.get('artist') or '').strip()
+        from_filename = False
+        if not title or not artist:
+            stem = Path(song.get('filename', '') or song.get('path', '')).stem
+            if ' - ' in stem:
+                a, t = stem.split(' - ', 1)
+                if not artist:
+                    artist = a.strip()
+                    from_filename = True
+                if not title:
+                    title = t.strip()
+                    from_filename = True
+        return artist, title, from_filename
+
+    @classmethod
+    def miss_key_for_song(cls, song: dict) -> str:
+        artist, title, _ = cls.resolve_artist_title(song)
+        if not artist or not title:
+            return ''
+        return cls.miss_key(artist, title)
+
+    def _miss_cache_path(self) -> str:
+        return os.path.join(self._lyrics_folder, MISS_CACHE_NAME) if self._lyrics_folder else ''
+
+    def load_misses(self) -> dict[str, float]:
+        path = self._miss_cache_path()
+        with self._miss_lock:
+            if self._misses_loaded_for == path:
+                return dict(self._misses)
+            self._misses = {}
+            self._misses_loaded_for = path
+            if path and os.path.isfile(path):
+                try:
+                    with open(path, 'r', encoding='utf-8') as fh:
+                        raw = json.load(fh)
+                    now = time.time()
+                    if isinstance(raw, dict):
+                        for k, v in raw.items():
+                            # v1 wrote a bare timestamp; v2 writes a dict.
+                            if isinstance(v, (int, float)):
+                                v = {'ts': float(v), 'sources': ['lrclib']}
+                            if not isinstance(v, dict):
+                                continue
+                            try:
+                                ts = float(v.get('ts', 0))
+                            except (TypeError, ValueError):
+                                continue
+                            if now - ts < MISS_TTL_S:
+                                self._misses[str(k)] = dict(v, ts=ts)
+                except (OSError, ValueError):
+                    self._misses = {}
+            return dict(self._misses)
+
+    def miss_info(self, key: str) -> dict | None:
+        """Details of a remembered miss (``ts``, ``sources``, ``artist``,
+        ``title``) or None."""
+        if not key:
+            return None
+        self.load_misses()
+        with self._miss_lock:
+            info = self._misses.get(key)
+        if info is None or time.time() - float(info.get('ts', 0)) >= MISS_TTL_S:
+            return None
+        return dict(info)
+
+    def is_known_miss(self, key: str) -> bool:
+        return self.miss_info(key) is not None
+
+    # kept for older callers / tests
+    def is_recent_miss(self, key: str) -> bool:
+        return self.is_known_miss(key)
+
+    def record_miss(self, key: str, sources=(), artist: str = '', title: str = '') -> None:
+        self.load_misses()
+        with self._miss_lock:
+            self._misses[key] = {
+                'ts': time.time(),
+                'sources': list(sources) or ['lrclib'],
+                'artist': artist,
+                'title': title,
+            }
+
+    def not_found_count(self, songs_by_path: dict[str, dict]) -> int:
+        """How many songs without lyrics are remembered as not found online."""
+        return sum(
+            1 for path, song in songs_by_path.items()
+            if not self.has_lyrics(path) and self.is_known_miss(self.miss_key_for_song(song))
+        )
+
+    def forget_miss(self, key: str) -> None:
+        with self._miss_lock:
+            self._misses.pop(key, None)
+
+    def save_misses(self) -> None:
+        path = self._miss_cache_path()
+        if not path:
+            return
+        with self._miss_lock:
+            payload = dict(self._misses)
+        try:
+            os.makedirs(self._lyrics_folder, exist_ok=True)
+            tmp = path + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as fh:
+                json.dump(payload, fh)
+            os.replace(tmp, path)
+        except OSError:
+            pass
+
     # ── introspection ────────────────────────────────────────────────────────
 
     @property
     def count(self) -> int:
         return len(self._paths_with_lyrics)
+
+
+# ── LRC timestamp helpers (used by the Trimmer) ─────────────────────────────
+
+def shift_lrc_text(text: str, offset_ms: int) -> str:
+    """Shift every ``[mm:ss.xx]`` tag by ``offset_ms`` (negative = earlier).
+    Lines whose every timestamp would fall before 0 are dropped; a line with
+    some surviving timestamps keeps only those."""
+    if not offset_ms:
+        return text
+    out: list[str] = []
+    for line in text.splitlines():
+        stamps = list(_LRC_TS_RE.finditer(line))
+        if not stamps:
+            out.append(line)
+            continue
+        body = line[stamps[-1].end():]
+        kept: list[str] = []
+        for m in stamps:
+            mins, secs, frac = int(m.group(1)), int(m.group(2)), m.group(3) or '0'
+            frac_ms = int(frac.ljust(3, '0')[:3])
+            total = mins * 60_000 + secs * 1000 + frac_ms + offset_ms
+            if total < 0:
+                continue
+            kept.append(f'[{total // 60_000:02d}:{(total % 60_000) // 1000:02d}.'
+                        f'{(total % 1000) // 10:02d}]')
+        if kept:
+            out.append(''.join(kept) + body)
+    return '\n'.join(out) + ('\n' if text.endswith('\n') else '')
+
+
+def shift_lrc(path: str, offset_ms: int) -> bool:
+    """Rewrite ``path`` in place with shifted timestamps. Returns True if the
+    file was changed."""
+    if not offset_ms or not os.path.isfile(path):
+        return False
+    try:
+        with open(path, 'r', encoding='utf-8', errors='replace') as fh:
+            text = fh.read()
+    except OSError:
+        return False
+    shifted = shift_lrc_text(text, offset_ms)
+    if shifted == text:
+        return False
+    tmp = path + '.tmp'
+    try:
+        with open(tmp, 'w', encoding='utf-8') as fh:
+            fh.write(shifted)
+        os.replace(tmp, path)
+    except OSError:
+        return False
+    return True

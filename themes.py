@@ -1,263 +1,162 @@
 """
-themes.py – Three color palettes for SongSyncer: Light, Purple, Orange.
-All UI colors are defined here so the app can switch themes at runtime.
+themes.py – Four macOS-style palettes for SongSyncer.
+
+``light`` is macOS Light with the system blue accent; ``purple``, ``pink`` and
+``green`` share one macOS Dark base and differ only in accent colour (the way
+the macOS "Accent colour" setting works). Every palette carries the same keys
+so ``style.build_stylesheet`` and the widgets can swap at runtime. Values are
+plain hex — several widgets feed them straight into ``QColor(str)``.
 """
+
+
+def _dark(name: str, accent: str, accent_hover: str, accent_pressed: str,
+          selection: str, sidebar_active: str) -> dict:
+    return {
+        'name': name,
+        # backgrounds (macOS dark: window #1e1e1e, sidebar slightly lighter)
+        'bg': '#1e1e1e',
+        'bg_alt': '#252526',
+        'bg_card': '#2c2c2e',
+        'bg_hover': '#3a3a3c',
+        'bg_input': '#1c1c1e',
+        'bg_selection': selection,
+        'sidebar_bg': '#232325',
+        'sidebar_active_bg': sidebar_active,
+        'sidebar_active_fg': '#ffffff',
+        'toolbar_bg': '#2a2a2c',
+        'badge_bg': '#3a3a3c',
+        'badge_fg': '#d1d1d6',
+        'separator': '#38383a',
+        # borders
+        'border': '#3a3a3c',
+        'border_light': '#2f2f31',
+        # text
+        'text': '#f5f5f7',
+        'text_secondary': '#d1d1d6',
+        'text_muted': '#98989d',
+        'text_dim': '#636366',
+        # accent
+        'accent': accent,
+        'accent_hover': accent_hover,
+        'accent_pressed': accent_pressed,
+        # semantic (macOS dark system colours)
+        'green': '#30d158',
+        'green_hover': '#28b64c',
+        'green_pressed': '#219a40',
+        'red': '#ff453a',
+        'red_hover': '#e03d33',
+        'red_pressed': '#c2352c',
+        'orange': '#ff9f0a',
+        'orange_hover': '#e08c09',
+        'orange_pressed': '#c27a08',
+        'blue': '#0a84ff',
+        'blue_hover': '#0974e0',
+        'blue_pressed': '#0864c2',
+        'cyan': '#64d2ff',
+        'cyan_hover': '#58b9e0',
+        'cyan_pressed': '#4ca1c2',
+        'gray_btn': '#3a3a3c',
+        'gray_btn_border': '#48484a',
+        # disabled
+        'disabled_bg': '#2c2c2e',
+        'disabled_text': '#5a5a5e',
+        'disabled_border': '#3a3a3c',
+        # misc
+        'scrollbar': '#5a5a5e',
+        'placeholder_bg': '#2c2c2e',
+        'tooltip_bg': '#2c2c2e',
+        'tooltip_border': '#48484a',
+        'msgbox_bg': '#2c2c2e',
+        # player
+        'player_bg': '#252526',
+        'player_border': '#38383a',
+        # cover placeholders
+        'cover_has': '#30d158',
+        'cover_missing': '#3a3a3c',
+        # tag dialog helpers
+        'partial_bg': '#3b2f12',
+        'partial_fg': '#ffd60a',
+        'checked_bg': sidebar_active,
+        'error_fg': '#ff6961',
+        'warning_fg': '#ffb340',
+        'success_fg': '#30d158',
+    }
+
 
 LIGHT = {
     'name': 'Light',
-    # backgrounds
-    'bg': '#f8fafc',
+    # backgrounds (macOS light: window #f5f5f7, content white)
+    'bg': '#f5f5f7',
     'bg_alt': '#ffffff',
     'bg_card': '#ffffff',
-    'bg_hover': '#f1f5f9',
+    'bg_hover': '#ececef',
     'bg_input': '#ffffff',
-    'bg_selection': '#ede9fe',
+    'bg_selection': '#d9e8ff',
+    'sidebar_bg': '#ededf0',
+    'sidebar_active_bg': '#007aff',
+    'sidebar_active_fg': '#ffffff',
+    'toolbar_bg': '#f9f9fb',
+    'badge_bg': '#dcdce0',
+    'badge_fg': '#3a3a3c',
+    'separator': '#e1e1e5',
     # borders
-    'border': '#e2e8f0',
-    'border_light': '#f1f5f9',
+    'border': '#d2d2d7',
+    'border_light': '#e5e5ea',
     # text
-    'text': '#1e293b',
-    'text_secondary': '#475569',
-    'text_muted': '#64748b',
-    'text_dim': '#94a3b8',
-    # accent
-    'accent': '#7c3aed',
-    'accent_hover': '#6d28d9',
-    'accent_pressed': '#5b21b6',
-    # semantic buttons
-    'green': '#059669',
-    'green_hover': '#047857',
-    'green_pressed': '#065f46',
-    'red': '#dc2626',
-    'red_hover': '#b91c1c',
-    'red_pressed': '#991b1b',
-    'orange': '#b45309',
-    'orange_hover': '#92400e',
-    'orange_pressed': '#78350f',
-    'blue': '#2563eb',
-    'blue_hover': '#1d4ed8',
-    'blue_pressed': '#1e40af',
-    'cyan': '#0891b2',
-    'cyan_hover': '#0e7490',
-    'cyan_pressed': '#155e75',
-    'gray_btn': '#e2e8f0',
-    'gray_btn_border': '#cbd5e1',
+    'text': '#1d1d1f',
+    'text_secondary': '#3a3a3c',
+    'text_muted': '#6e6e73',
+    'text_dim': '#8e8e93',
+    # accent (system blue)
+    'accent': '#007aff',
+    'accent_hover': '#0a6fe0',
+    'accent_pressed': '#0862c2',
+    # semantic (macOS light system colours)
+    'green': '#34c759',
+    'green_hover': '#2db24f',
+    'green_pressed': '#279a45',
+    'red': '#ff3b30',
+    'red_hover': '#e0342a',
+    'red_pressed': '#c22d24',
+    'orange': '#ff9500',
+    'orange_hover': '#e08400',
+    'orange_pressed': '#c27200',
+    'blue': '#007aff',
+    'blue_hover': '#0a6fe0',
+    'blue_pressed': '#0862c2',
+    'cyan': '#32ade6',
+    'cyan_hover': '#2c98ca',
+    'cyan_pressed': '#2683ae',
+    'gray_btn': '#e9e9ed',
+    'gray_btn_border': '#d2d2d7',
     # disabled
-    'disabled_bg': '#f1f5f9',
-    'disabled_text': '#cbd5e1',
-    'disabled_border': '#e2e8f0',
+    'disabled_bg': '#f0f0f3',
+    'disabled_text': '#b8b8bd',
+    'disabled_border': '#e5e5ea',
     # misc
-    'scrollbar': '#cbd5e1',
-    'placeholder_bg': '#e2e8f0',
+    'scrollbar': '#c7c7cc',
+    'placeholder_bg': '#e5e5ea',
     'tooltip_bg': '#ffffff',
-    'tooltip_border': '#e2e8f0',
+    'tooltip_border': '#d2d2d7',
     'msgbox_bg': '#ffffff',
     # player
-    'player_bg': '#ffffff',
-    'player_border': '#e2e8f0',
+    'player_bg': '#f9f9fb',
+    'player_border': '#e1e1e5',
     # cover placeholders
-    'cover_has': '#059669',
-    'cover_missing': '#e2e8f0',
+    'cover_has': '#34c759',
+    'cover_missing': '#e5e5ea',
     # tag dialog helpers
-    'partial_bg': '#fef3c7',
-    'partial_fg': '#b45309',
-    'checked_bg': '#dbeafe',
-    'error_fg': '#dc2626',
-    'warning_fg': '#b45309',
-    'success_fg': '#059669',
+    'partial_bg': '#fff4d6',
+    'partial_fg': '#b25e00',
+    'checked_bg': '#d9e8ff',
+    'error_fg': '#ff3b30',
+    'warning_fg': '#c77700',
+    'success_fg': '#248a3d',
 }
 
-PURPLE = {
-    'name': 'Purple',
-    # backgrounds
-    'bg': '#0f0f1a',
-    'bg_alt': '#0a0a14',
-    'bg_card': '#1a1a2e',
-    'bg_hover': '#1e1e35',
-    'bg_input': '#13131f',
-    'bg_selection': '#2e1065',
-    # borders
-    'border': '#2d2d4e',
-    'border_light': '#1e1e35',
-    # text
-    'text': '#e2e8f0',
-    'text_secondary': '#94a3b8',
-    'text_muted': '#64748b',
-    'text_dim': '#4a5568',
-    # accent (purple)
-    'accent': '#7c3aed',
-    'accent_hover': '#6d28d9',
-    'accent_pressed': '#5b21b6',
-    # semantic buttons
-    'green': '#059669',
-    'green_hover': '#047857',
-    'green_pressed': '#065f46',
-    'red': '#dc2626',
-    'red_hover': '#b91c1c',
-    'red_pressed': '#991b1b',
-    'orange': '#b45309',
-    'orange_hover': '#92400e',
-    'orange_pressed': '#78350f',
-    'blue': '#2563eb',
-    'blue_hover': '#1d4ed8',
-    'blue_pressed': '#1e40af',
-    'cyan': '#0891b2',
-    'cyan_hover': '#0e7490',
-    'cyan_pressed': '#155e75',
-    'gray_btn': '#374151',
-    'gray_btn_border': '#4b5563',
-    # disabled
-    'disabled_bg': '#1a1a2e',
-    'disabled_text': '#2d3748',
-    'disabled_border': '#1e1e35',
-    # misc
-    'scrollbar': '#2d2d4e',
-    'placeholder_bg': '#0a0a14',
-    'tooltip_bg': '#1e1e35',
-    'tooltip_border': '#3a3a5e',
-    'msgbox_bg': '#1a1a2e',
-    # player
-    'player_bg': '#0a0a14',
-    'player_border': '#1e1e35',
-    # cover placeholders
-    'cover_has': '#059669',
-    'cover_missing': '#2d2d4e',
-    # tag dialog helpers
-    'partial_bg': '#2b2112',
-    'partial_fg': '#f59e0b',
-    'checked_bg': '#1e2a4a',
-    'error_fg': '#f87171',
-    'warning_fg': '#f59e0b',
-    'success_fg': '#34d399',
-}
-
-PINK = {
-    'name': 'Pink',
-    # backgrounds – dark with rosy undertones
-    'bg': '#1a0f14',
-    'bg_alt': '#140c10',
-    'bg_card': '#2a1822',
-    'bg_hover': '#351e2c',
-    'bg_input': '#1f1218',
-    'bg_selection': '#4a1038',
-    # borders
-    'border': '#4e2840',
-    'border_light': '#351e2c',
-    # text
-    'text': '#f0e0ea',
-    'text_secondary': '#b898a8',
-    'text_muted': '#8b6a7b',
-    'text_dim': '#684858',
-    # accent (pink)
-    'accent': '#e8448a',
-    'accent_hover': '#d03878',
-    'accent_pressed': '#b82c66',
-    # semantic buttons
-    'green': '#059669',
-    'green_hover': '#047857',
-    'green_pressed': '#065f46',
-    'red': '#dc2626',
-    'red_hover': '#b91c1c',
-    'red_pressed': '#991b1b',
-    'orange': '#b45309',
-    'orange_hover': '#92400e',
-    'orange_pressed': '#78350f',
-    'blue': '#2563eb',
-    'blue_hover': '#1d4ed8',
-    'blue_pressed': '#1e40af',
-    'cyan': '#0891b2',
-    'cyan_hover': '#0e7490',
-    'cyan_pressed': '#155e75',
-    'gray_btn': '#3d2830',
-    'gray_btn_border': '#5a3848',
-    # disabled
-    'disabled_bg': '#2a1822',
-    'disabled_text': '#3d2830',
-    'disabled_border': '#351e2c',
-    # misc
-    'scrollbar': '#4e2840',
-    'placeholder_bg': '#140c10',
-    'tooltip_bg': '#351e2c',
-    'tooltip_border': '#5a3848',
-    'msgbox_bg': '#2a1822',
-    # player
-    'player_bg': '#140c10',
-    'player_border': '#351e2c',
-    # cover placeholders
-    'cover_has': '#059669',
-    'cover_missing': '#4e2840',
-    # tag dialog helpers
-    'partial_bg': '#2b1222',
-    'partial_fg': '#f59eb0',
-    'checked_bg': '#2a1830',
-    'error_fg': '#f87171',
-    'warning_fg': '#f59e0b',
-    'success_fg': '#34d399',
-}
-
-GREEN = {
-    'name': 'Green',
-    # backgrounds – dark with forest undertones
-    'bg': '#0f1a12',
-    'bg_alt': '#0c140e',
-    'bg_card': '#182a1c',
-    'bg_hover': '#1e3524',
-    'bg_input': '#121f15',
-    'bg_selection': '#104a1a',
-    # borders
-    'border': '#284e30',
-    'border_light': '#1e3524',
-    # text
-    'text': '#e0f0e4',
-    'text_secondary': '#98b8a0',
-    'text_muted': '#6a8b72',
-    'text_dim': '#486850',
-    # accent (green)
-    'accent': '#22c55e',
-    'accent_hover': '#16a34a',
-    'accent_pressed': '#15803d',
-    # semantic buttons
-    'green': '#22c55e',
-    'green_hover': '#16a34a',
-    'green_pressed': '#15803d',
-    'red': '#dc2626',
-    'red_hover': '#b91c1c',
-    'red_pressed': '#991b1b',
-    'orange': '#b45309',
-    'orange_hover': '#92400e',
-    'orange_pressed': '#78350f',
-    'blue': '#2563eb',
-    'blue_hover': '#1d4ed8',
-    'blue_pressed': '#1e40af',
-    'cyan': '#0891b2',
-    'cyan_hover': '#0e7490',
-    'cyan_pressed': '#155e75',
-    'gray_btn': '#283d2e',
-    'gray_btn_border': '#385a40',
-    # disabled
-    'disabled_bg': '#182a1c',
-    'disabled_text': '#283d2e',
-    'disabled_border': '#1e3524',
-    # misc
-    'scrollbar': '#284e30',
-    'placeholder_bg': '#0c140e',
-    'tooltip_bg': '#1e3524',
-    'tooltip_border': '#385a40',
-    'msgbox_bg': '#182a1c',
-    # player
-    'player_bg': '#0c140e',
-    'player_border': '#1e3524',
-    # cover placeholders
-    'cover_has': '#22c55e',
-    'cover_missing': '#284e30',
-    # tag dialog helpers
-    'partial_bg': '#122b18',
-    'partial_fg': '#86efac',
-    'checked_bg': '#182a22',
-    'error_fg': '#f87171',
-    'warning_fg': '#f59e0b',
-    'success_fg': '#34d399',
-}
+PURPLE = _dark('Purple', '#bf5af2', '#ab4fd9', '#9645bf', '#3d2a52', '#7d3fb0')
+PINK   = _dark('Pink',   '#ff375f', '#e03154', '#c22b49', '#4a2431', '#b8294a')
+GREEN  = _dark('Green',  '#30d158', '#28b64c', '#219a40', '#1f3d29', '#22843c')
 
 # Ordered cycle: Light → Purple → Pink → Green → Light …
 THEME_ORDER = ['light', 'purple', 'pink', 'green']

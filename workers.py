@@ -4,6 +4,7 @@ workers.py – QThread workers for all background operations.
 
 import os
 import queue
+import threading
 import time
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -17,7 +18,8 @@ from cover_art import (
     write_cover, delete_cover, SUPPORTED_EXTENSIONS,
 )
 from image_utils import decode_cover_thumbnails
-from lyrics_fetcher import fetch_from_lrclib
+from json_health import build_health_report
+from lyrics_fetcher import fetch_lyrics, SOURCES as LYRICS_SOURCES
 from lyrics_store import LyricsStore
 from playlist_store import PlaylistAssignmentStore
 from search import build_query, search_cover_art, download_image
@@ -229,79 +231,139 @@ class AutoAssignWorker(QThread):
 
 # ── Lyrics fetch worker ───────────────────────────────────────────────────────
 
+class _RateLimiter:
+    """Token-bucket-ish pacing shared by the parallel lyrics fetchers so the
+    total request rate to lrclib.net stays polite regardless of thread count."""
+
+    def __init__(self, per_second: float):
+        self._interval = 1.0 / max(0.1, per_second)
+        self._lock = threading.Lock()
+        self._next = 0.0
+
+    def wait(self):
+        with self._lock:
+            now = time.monotonic()
+            slot = max(now, self._next)
+            self._next = slot + self._interval
+        delay = slot - now
+        if delay > 0:
+            time.sleep(delay)
+
+
 class LyricsFetchWorker(QThread):
-    """Download .lrc files from LRCLIB for a list of songs."""
+    """Download .lrc files from LRCLIB for a list of songs.
 
-    song_done = pyqtSignal(str, bool)         # (path, success)
-    progress  = pyqtSignal(int, int, str)     # (current, total, song_title)
-    finished  = pyqtSignal(int, int)          # (fetched, failed)
+    Runs ``max_workers`` fetches in parallel behind a shared rate limiter,
+    skips songs that already have lyrics or are a recent known miss, and can
+    be re-targeted to a new lyrics folder mid-run (``retarget``) so a path
+    change in Settings never interrupts the download."""
 
-    def __init__(self, songs: list, lyrics_folder: str):
+    song_done = pyqtSignal(str, str)          # (path, status: ok|exists|miss|known_miss|skipped|cancelled)
+    progress  = pyqtSignal(int, int, str)     # (done, total, song_title)
+    finished  = pyqtSignal(int, int, int)     # (fetched, failed, skipped)
+
+    STATUS_OK = 'ok'
+    STATUS_EXISTS = 'exists'
+    STATUS_MISS = 'miss'              # asked every source, nothing — now remembered
+    STATUS_KNOWN_MISS = 'known_miss'  # remembered from an earlier session, not asked again
+    STATUS_SKIPPED = 'skipped'        # no artist/title to search with
+    STATUS_CANCELLED = 'cancelled'
+
+    def __init__(self, songs: list, lyrics_folder: str,
+                 max_workers: int = 4, requests_per_second: float = 6.0):
         super().__init__()
-        self.songs = songs
-        self.lyrics_folder = lyrics_folder
+        self.songs = list(songs)
         self._stop = False
-        # Local store instance used only for path math + atomic write.
+        self._max_workers = max(1, int(max_workers))
+        self._limiter = _RateLimiter(requests_per_second)
+        # Local store instance used only for path math + atomic write. Its
+        # folder can be swapped while running.
         self._store = LyricsStore(lyrics_folder)
+        self._done = 0
 
     def cancel(self):
         self._stop = True
 
-    def run(self):
-        fetched = 0
-        failed  = 0
-        total   = len(self.songs)
+    def retarget(self, lyrics_folder: str):
+        """Point subsequent writes at a new lyrics folder (files already
+        written stay where they are)."""
+        self._store.save_misses()
+        self._store.set_folder(lyrics_folder)
 
-        for i, song in enumerate(self.songs):
-            if self._stop:
-                break
+    @property
+    def lyrics_folder(self) -> str:
+        return self._store.get_folder()
 
-            path = song.get('path', '')
-            title  = (song.get('title') or '').strip()
-            artist = (song.get('artist') or '').strip()
-            album  = (song.get('album') or '').strip()
-            duration_ms = song.get('duration_ms', 0)
+    # ── per-song job (runs in the pool) ─────────────────────────────────────
 
-            # Fall back to splitting the filename on ' - ' if metadata is empty.
-            if not title or not artist:
-                stem = Path(song.get('filename', '')).stem
-                if ' - ' in stem:
-                    a, t = stem.split(' - ', 1)
-                    if not artist:
-                        artist = a.strip()
-                    if not title:
-                        title = t.strip()
+    def _fetch_one(self, song: dict) -> tuple[str, str]:
+        path = song.get('path', '')
+        if self._stop:
+            return path, self.STATUS_CANCELLED
 
-            display = song.get('title') or song.get('filename') or path
-            self.progress.emit(i + 1, total, display)
+        # Skip if a .lrc already exists for this song.
+        dest = self._store.lrc_path_for(path)
+        if dest and os.path.isfile(dest):
+            return path, self.STATUS_EXISTS
 
-            # Skip if a .lrc already exists for this song.
-            dest = self._store.lrc_path_for(path)
-            if dest and os.path.isfile(dest):
-                self.song_done.emit(path, True)
-                fetched += 1
-                continue
+        artist, title, from_filename = LyricsStore.resolve_artist_title(song)
+        album = (song.get('album') or '').strip()
+        duration_ms = song.get('duration_ms', 0)
+        if not title or not artist:
+            return path, self.STATUS_SKIPPED
 
-            ok = False
+        key = LyricsStore.miss_key(artist, title)
+        if self._store.is_known_miss(key):
+            return path, self.STATUS_KNOWN_MISS
+
+        try:
+            text, _source = fetch_lyrics(title, artist, album, duration_ms,
+                                         throttle=self._limiter.wait,
+                                         allow_swap=from_filename)
+        except Exception:
+            text = None
+        if self._stop:
+            return path, self.STATUS_CANCELLED
+        if text:
             try:
-                text = fetch_from_lrclib(title, artist, album, duration_ms)
-                if text:
-                    self._store.save_text(path, text)
-                    ok = True
-            except Exception:
-                ok = False
+                self._store.save_text(path, text)
+                self._store.forget_miss(key)
+                return path, self.STATUS_OK
+            except (OSError, ValueError):
+                return path, self.STATUS_MISS
+        self._store.record_miss(key, LYRICS_SOURCES, artist, title)
+        return path, self.STATUS_MISS
 
-            if ok:
-                fetched += 1
-            else:
-                failed += 1
-            self.song_done.emit(path, ok)
-
-            # Polite throttle between requests.
-            if i < total - 1 and not self._stop:
-                time.sleep(0.35)
-
-        self.finished.emit(fetched, failed)
+    def run(self):
+        fetched = failed = skipped = 0
+        total = len(self.songs)
+        self._store.load_misses()
+        try:
+            with ThreadPoolExecutor(max_workers=self._max_workers) as pool:
+                futures = {pool.submit(self._fetch_one, song): song for song in self.songs}
+                for future in as_completed(futures):
+                    song = futures[future]
+                    path = song.get('path', '')
+                    try:
+                        path, status = future.result()
+                    except Exception:
+                        status = self.STATUS_MISS
+                    self._done += 1
+                    if status in (self.STATUS_OK, self.STATUS_EXISTS):
+                        fetched += 1
+                    elif status in (self.STATUS_MISS, self.STATUS_KNOWN_MISS):
+                        failed += 1
+                    else:
+                        skipped += 1
+                    display = song.get('title') or song.get('filename') or path
+                    self.progress.emit(self._done, total, display)
+                    self.song_done.emit(path, status)
+                    if self._stop:
+                        pool.shutdown(wait=False, cancel_futures=True)
+                        break
+        finally:
+            self._store.save_misses()
+        self.finished.emit(fetched, failed, skipped)
 
 
 # ── Image-search worker ───────────────────────────────────────────────────────
@@ -347,9 +409,22 @@ class ImageDownloadWorker(QThread):
 
 
 class PlaylistReconcileWorker(QThread):
-    """Reconcile playlist JSON records against the current library off the UI thread."""
+    """Reconcile playlist JSON records against the current library off the UI
+    thread, and — on the same background thread — run the strict-sync audit
+    (``json_health.build_health_report``) too.
 
-    result_ready = pyqtSignal(int, dict)  # (sequence, reconcile_result)
+    The audit used to run synchronously on the UI thread every time a
+    reconcile completed (including the debounced re-check after every Edit
+    Song save), and its ``difflib.get_close_matches`` fuzzy search over
+    every unmatched JSON record against every file on disk is O(missing ×
+    library size): on a library of a few thousand songs with a few hundred
+    drifted/missing entries that was measured to freeze the UI for 1-3+
+    seconds per reconcile. Computing it here means the UI thread only ever
+    does the cheap, already-computed-list bookkeeping in
+    ``MainWindow._rebuild_playlist_issue_map``.
+    """
+
+    result_ready = pyqtSignal(int, dict, list)  # (sequence, reconcile_result, health_issues)
     error = pyqtSignal(int, str)          # (sequence, message)
 
     def __init__(
@@ -359,6 +434,7 @@ class PlaylistReconcileWorker(QThread):
         songs_by_path: dict[str, dict],
         library_root: str,
         valid_tags: list[str],
+        lyrics_store: LyricsStore | None = None,
     ):
         super().__init__()
         self.sequence = sequence
@@ -369,6 +445,7 @@ class PlaylistReconcileWorker(QThread):
         }
         self.library_root = library_root
         self.valid_tags = list(valid_tags)
+        self.lyrics_store = lyrics_store
 
     def run(self):
         try:
@@ -379,7 +456,16 @@ class PlaylistReconcileWorker(QThread):
                 self.library_root,
                 self.valid_tags,
             )
-            self.result_ready.emit(self.sequence, result)
+            # Apply the result to this throwaway store (never the live one —
+            # that still happens on the UI thread) purely so the audit below
+            # sees fully-populated _path_to_record / missing_song_records /
+            # duplicate_records, exactly as MainWindow._on_playlist_reconcile
+            # _complete would produce on the real store from the same result.
+            store.apply_reconcile_result(result, self.songs_by_path, self.library_root)
+            health_issues = build_health_report(
+                store, self.songs_by_path, (), self.lyrics_store,
+            )
+            self.result_ready.emit(self.sequence, result, health_issues)
         except Exception as exc:
             self.error.emit(self.sequence, str(exc))
 
@@ -464,3 +550,52 @@ def _clean_query_part(text: str) -> str:
     text = re.sub(r'\[[^\]]*\]', '', text)
     text = re.sub(r'\s+', ' ', text)
     return text.strip()
+
+
+# ── Trimmer workers ───────────────────────────────────────────────────────────
+
+class WaveformWorker(QThread):
+    """Decode a song to a peak envelope off the UI thread."""
+
+    ready = pyqtSignal(list, int)     # (peaks, duration_ms)
+    error = pyqtSignal(str)
+
+    def __init__(self, path: str, buckets: int = 1600):
+        super().__init__()
+        self.path = path
+        self.buckets = buckets
+
+    def run(self):
+        try:
+            from audio_trim import compute_peaks
+            peaks, duration = compute_peaks(self.path, self.buckets)
+            self.ready.emit(peaks, duration)
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+
+class TrimWorker(QThread):
+    """Run ``audio_trim.trim`` off the UI thread."""
+
+    done = pyqtSignal(object)         # TrimResult
+    error = pyqtSignal(str)
+
+    def __init__(self, path: str, start_ms: int, end_ms: int,
+                 fade_in_ms: int = 0, fade_out_ms: int = 0, keep_backup: bool = False):
+        super().__init__()
+        self.path = path
+        self.start_ms = start_ms
+        self.end_ms = end_ms
+        self.fade_in_ms = fade_in_ms
+        self.fade_out_ms = fade_out_ms
+        self.keep_backup = keep_backup
+
+    def run(self):
+        try:
+            from audio_trim import trim
+            result = trim(self.path, self.start_ms, self.end_ms,
+                          fade_in_ms=self.fade_in_ms, fade_out_ms=self.fade_out_ms,
+                          keep_backup=self.keep_backup)
+            self.done.emit(result)
+        except Exception as exc:
+            self.error.emit(str(exc))

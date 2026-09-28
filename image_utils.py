@@ -18,6 +18,22 @@ _DECODE_FAILURES = 0
 _FILE_SANITIZED_CACHE: dict[str, bytes | None] = {}
 _FILE_DATA_URI_CACHE: dict[tuple[str, int], str] = {}
 _FILE_ICON_CACHE: dict[tuple[str, int], QIcon] = {}
+# Path.resolve() is a real filesystem call (lstat on every path component to
+# follow symlinks) — cheap once, but icon_from_file/data_uri_from_file are
+# each called once per (song, tag) pair, so the same ~50 tag icon paths get
+# "resolved" thousands of times per reconcile on a large library. Since none
+# of these files move mid-session, the resolved key itself is memoized too
+# (separately from the cache keyed BY that value below), which is what
+# actually eliminates the repeat syscalls.
+_RESOLVE_CACHE: dict[str, str] = {}
+
+
+def _resolved_key(path: str) -> str:
+    key = _RESOLVE_CACHE.get(path)
+    if key is None:
+        key = str(Path(path).resolve())
+        _RESOLVE_CACHE[path] = key
+    return key
 
 
 def reset_decode_failures():
@@ -30,10 +46,24 @@ def get_decode_failures() -> int:
 
 
 def sanitize_image_bytes(data: bytes) -> bytes | None:
-    """Decode and re-encode image bytes to strip broken color profiles."""
+    """Decode and re-encode image bytes to strip broken color profiles.
+
+    Fast path: an image with no embedded ICC profile has nothing to strip,
+    so it is returned unchanged (still validated by decoding it) instead of
+    paying for a full PIL rebuild + re-encode. That round trip — especially
+    with ``optimize=True``, a slow multi-pass compression search meant for
+    files written to disk — used to run unconditionally on every image, so
+    opening a dialog that loads many tag icons for the first time (Edit
+    Song, Assign Tags: ~50 icons) froze the UI thread for upwards of ten
+    seconds with no feedback, easily mistaken for a crash. The output here
+    is only ever fed straight back into Qt's decoder and discarded, so file
+    size never mattered — only correctness and speed do.
+    """
     try:
         with Image.open(BytesIO(data)) as src:
             src.load()
+            if not src.info.get('icc_profile'):
+                return data
             if src.mode not in ('RGB', 'RGBA'):
                 src = src.convert('RGBA')
             else:
@@ -41,7 +71,7 @@ def sanitize_image_bytes(data: bytes) -> bytes | None:
             # Rebuild from raw pixels to guarantee metadata/profile stripping.
             img = Image.frombytes(src.mode, src.size, src.tobytes())
             out = BytesIO()
-            img.save(out, format='PNG', optimize=True, icc_profile=None)
+            img.save(out, format='PNG', optimize=False, icc_profile=None)
             clean = out.getvalue()
             return clean if clean else None
     except Exception:
@@ -49,7 +79,7 @@ def sanitize_image_bytes(data: bytes) -> bytes | None:
 
 
 def _sanitize_image_file(path: str) -> bytes | None:
-    key = str(Path(path).resolve())
+    key = _resolved_key(path)
     if key in _FILE_SANITIZED_CACHE:
         return _FILE_SANITIZED_CACHE[key]
     try:
@@ -116,8 +146,22 @@ def load_cropped_pixmap(data: bytes, size: int) -> QPixmap | None:
     return scaled.copy(x, y, size, size)
 
 
+_FILE_URI_CACHE: dict[str, str] = {}
+
+
+def file_uri(path: str) -> str:
+    """Cached ``file://...`` URI for embedding in HTML (``<img src="...">``).
+    Same repeat-resolve()-call problem as icon_from_file, at the same scale
+    (once per tag per song) — see ``_resolved_key``."""
+    uri = _FILE_URI_CACHE.get(path)
+    if uri is None:
+        uri = Path(_resolved_key(path)).as_uri()
+        _FILE_URI_CACHE[path] = uri
+    return uri
+
+
 def icon_from_file(path: str, size: int = 32) -> QIcon:
-    key = str(Path(path).resolve())
+    key = _resolved_key(path)
     cache_key = (key, int(size))
     if cache_key in _FILE_ICON_CACHE:
         return _FILE_ICON_CACHE[cache_key]
@@ -138,7 +182,7 @@ def icon_from_file(path: str, size: int = 32) -> QIcon:
 
 
 def data_uri_from_file(path: str, size: int = 16) -> str:
-    key = str(Path(path).resolve())
+    key = _resolved_key(path)
     cache_key = (key, int(size))
     if cache_key in _FILE_DATA_URI_CACHE:
         return _FILE_DATA_URI_CACHE[cache_key]
@@ -155,7 +199,11 @@ def data_uri_from_file(path: str, size: int = 16) -> str:
             if size > 0:
                 img = img.resize((size, size), Image.Resampling.LANCZOS)
             out = BytesIO()
-            img.save(out, format='PNG', optimize=True, icc_profile=None)
+            # optimize=False: this result is base64-inlined into HTML for a
+            # QLabel, never written to disk, so — same reasoning as
+            # sanitize_image_bytes above — only decode correctness and speed
+            # matter here, not the encoded byte count.
+            img.save(out, format='PNG', optimize=False, icc_profile=None)
             payload = out.getvalue()
     except Exception:
         payload = clean
